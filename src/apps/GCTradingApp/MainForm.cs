@@ -94,6 +94,18 @@ public partial class MainForm : Form
     private Label lblTF2Status = null!;
     private Label lblTF3Status = null!;
 
+    // Paper Trading
+    private PaperTradingClient? _paperClient;
+    private RadioButton rbLiveTrading = null!;
+    private RadioButton rbPaperTrading = null!;
+    private GroupBox grpPaperSettings = null!;
+    private NumericUpDown numPaperSlippage = null!;
+    private NumericUpDown numPaperDelay = null!;
+    private NumericUpDown numPaperBalance = null!;
+    private Label lblPaperPnL = null!;
+    private Label lblPaperPosition = null!;
+    private Button btnResetPaper = null!;
+
     public MainForm()
     {
         Logger.Info("MainForm constructor starting...");
@@ -319,19 +331,55 @@ public partial class MainForm : Form
         {
             Text = "GC Contract",
             Location = new Point(990, 160),
-            Size = new Size(390, 90)
+            Size = new Size(200, 90)
         };
 
         var lblContractInfo = new Label
         {
-            Text = "Symbol: GC  |  Exchange: COMEX\nMultiplier: 100 oz\nHours: 6PM-5PM ET (Sun-Fri)",
+            Text = "Symbol: GC\nExchange: COMEX\nMultiplier: 100 oz",
             Location = new Point(10, 22),
             AutoSize = true
         };
 
         grpContract.Controls.AddRange(new Control[] { lblContractInfo });
 
-        panel.Controls.AddRange(new Control[] { grpConnection, grpStatus, grpStrategy, grpControls, grpRisk, grpEmergency, grpMTF, grpContract });
+        // Paper Trading Mode
+        var grpPaperMode = new GroupBox
+        {
+            Text = "Trading Mode",
+            Location = new Point(1200, 160),
+            Size = new Size(180, 90)
+        };
+
+        rbLiveTrading = new RadioButton { Text = "Live Trading", Location = new Point(10, 20), AutoSize = true, Checked = !_state.PaperTradingEnabled };
+        rbPaperTrading = new RadioButton { Text = "Paper Trading", Location = new Point(10, 42), AutoSize = true, Checked = _state.PaperTradingEnabled };
+        rbPaperTrading.CheckedChanged += RbPaperTrading_CheckedChanged;
+
+        lblPaperPnL = new Label { Text = "Paper PnL: --", Location = new Point(10, 65), AutoSize = true, ForeColor = Color.Blue };
+
+        grpPaperMode.Controls.AddRange(new Control[] { rbLiveTrading, rbPaperTrading, lblPaperPnL });
+
+        // Paper Trading Settings (initially hidden unless paper mode)
+        grpPaperSettings = new GroupBox
+        {
+            Text = "Paper Settings",
+            Location = new Point(990, 0),
+            Size = new Size(390, 50),
+            Visible = _state.PaperTradingEnabled
+        };
+
+        var lblSlippage = new Label { Text = "Slippage (bps):", Location = new Point(10, 20), AutoSize = true };
+        numPaperSlippage = new NumericUpDown { Location = new Point(95, 17), Width = 50, Minimum = 0, Maximum = 100, DecimalPlaces = 1, Value = (decimal)_state.PaperSlippageBps };
+
+        var lblDelay = new Label { Text = "Delay (ms):", Location = new Point(155, 20), AutoSize = true };
+        numPaperDelay = new NumericUpDown { Location = new Point(225, 17), Width = 60, Minimum = 0, Maximum = 5000, Value = _state.PaperFillDelayMs };
+
+        btnResetPaper = new Button { Text = "Reset", Location = new Point(300, 14), Size = new Size(70, 28) };
+        btnResetPaper.Click += BtnResetPaper_Click;
+
+        grpPaperSettings.Controls.AddRange(new Control[] { lblSlippage, numPaperSlippage, lblDelay, numPaperDelay, btnResetPaper });
+
+        panel.Controls.AddRange(new Control[] { grpConnection, grpStatus, grpStrategy, grpControls, grpRisk, grpEmergency, grpMTF, grpContract, grpPaperMode, grpPaperSettings });
 
         return panel;
     }
@@ -672,6 +720,88 @@ public partial class MainForm : Form
             Log("[EMERGENCY] Flatten complete - trading paused");
             MessageBox.Show("Emergency flatten complete. Trading is now paused.", "Flatten Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
+    }
+
+    private void RbPaperTrading_CheckedChanged(object? sender, EventArgs e)
+    {
+        bool isPaperMode = rbPaperTrading.Checked;
+        grpPaperSettings.Visible = isPaperMode;
+        _state.PaperTradingEnabled = isPaperMode;
+        SaveState();
+
+        if (isPaperMode)
+        {
+            Log("[PAPER] Paper trading mode enabled");
+            // Create paper trading client if not exists
+            if (_paperClient == null)
+            {
+                var config = new PaperTradingConfig
+                {
+                    SlippageBps = (double)numPaperSlippage.Value,
+                    FillDelayMs = (int)numPaperDelay.Value,
+                    InitialBalance = _state.PaperInitialBalance
+                };
+                _paperClient = new PaperTradingClient(config);
+                _paperClient.OnStateChanged += PaperClient_OnStateChanged;
+                _paperClient.OnLog += msg => Log($"[PAPER] {msg}");
+
+                // Restore saved paper state if available
+                if (_state.PaperState != null)
+                {
+                    _paperClient.RestoreState(_state.PaperState);
+                }
+            }
+        }
+        else
+        {
+            Log("[PAPER] Live trading mode enabled");
+        }
+    }
+
+    private void PaperClient_OnStateChanged(PaperTradingState state)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(new Action<PaperTradingState>(PaperClient_OnStateChanged), state);
+            return;
+        }
+
+        lblPaperPnL.Text = $"Paper PnL: ${state.RealizedPnL:N2}";
+        lblPaperPnL.ForeColor = state.RealizedPnL >= 0 ? Color.Green : Color.Red;
+
+        // Save paper state
+        _state.PaperState = state;
+        SaveState();
+    }
+
+    private void BtnResetPaper_Click(object? sender, EventArgs e)
+    {
+        var result = MessageBox.Show(
+            "Are you sure you want to reset the paper trading account?\n\n" +
+            "This will clear all paper trading history and reset the balance.",
+            "Reset Paper Account",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (result == DialogResult.Yes)
+        {
+            _paperClient?.Reset();
+            _state.PaperState = null;
+            SaveState();
+            Log("[PAPER] Paper trading account reset");
+        }
+    }
+
+    /// <summary>
+    /// Gets the order client to use based on current trading mode
+    /// </summary>
+    private IOrderClient GetOrderClient()
+    {
+        if (rbPaperTrading.Checked && _paperClient != null)
+        {
+            return _paperClient;
+        }
+        return _ibClient!;
     }
 
     private void IbClient_OnConnected()
@@ -1237,6 +1367,9 @@ public partial class MainForm : Form
 
     private void IbClient_OnRealtimeBar(BarData bar)
     {
+        // Forward bar to paper trading client for stop order processing
+        _paperClient?.ProcessBar(bar);
+
         // Forward to strategy engines
         _aggressiveEngine?.ProcessBar(bar);
         _conservativeEngine?.ProcessBar(bar);
@@ -1260,6 +1393,7 @@ public partial class MainForm : Form
 
             _aggressiveEngine = new GCStrategyEngine(
                 _ibClient!,
+                GetOrderClient(),  // Use paper or real based on mode
                 "Aggressive",
                 0.99,  // 99% position scale
                 false, // No DD protection
@@ -1280,6 +1414,7 @@ public partial class MainForm : Form
 
             _conservativeEngine = new GCStrategyEngine(
                 _ibClient!,
+                GetOrderClient(),  // Use paper or real based on mode
                 "Conservative",
                 0.62,  // 62% position scale
                 true,  // DD protection enabled
@@ -1370,7 +1505,7 @@ public partial class MainForm : Form
             AllowShorts = chkMTFAllowShorts.Checked
         };
 
-        _mtfEngine = new MTFStrategyEngine(_ibClient!, config, savedState);
+        _mtfEngine = new MTFStrategyEngine(_ibClient!, GetOrderClient(), config, savedState);
         _mtfEngine.OnLog += msg => Log(msg);
         _mtfEngine.OnStateChanged += OnMTFStateChanged;
         _mtfEngine.OnAlignmentUpdated += OnMTFAlignmentUpdated;

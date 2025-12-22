@@ -11,7 +11,8 @@ namespace GCTradingApp;
 /// </summary>
 public class GCStrategyEngine
 {
-    private readonly IBKRClient _client;
+    private readonly IBKRClient _dataClient;      // For market data (always real IBKR)
+    private readonly IOrderClient _orderClient;   // For orders (real or paper)
     private readonly string _strategyName;
     private readonly double _positionScale;
     private readonly bool _ddProtection;
@@ -76,7 +77,8 @@ public class GCStrategyEngine
     public event Action<StrategyState>? OnStateChanged;
 
     public GCStrategyEngine(
-        IBKRClient client,
+        IBKRClient dataClient,
+        IOrderClient orderClient,
         string strategyName,
         double positionScale,
         bool ddProtection,
@@ -85,7 +87,8 @@ public class GCStrategyEngine
         double maxDrawdown = 0.11,
         StrategyState? savedState = null)
     {
-        _client = client;
+        _dataClient = dataClient;
+        _orderClient = orderClient;
         _strategyName = strategyName;
         _positionScale = positionScale;
         _ddProtection = ddProtection;
@@ -107,9 +110,9 @@ public class GCStrategyEngine
             Log($"Restored position state - Entry: {_entryPrice:F2}, Stop: {_stopPrice:F2}, Target: {_targetPrice:F2}");
         }
 
-        _client.OnRealtimeBar += OnBar;
-        _client.OnOrderStatus += OnOrderStatus;
-        _client.OnAccountUpdate += OnAccountUpdate;
+        _dataClient.OnRealtimeBar += OnBar;
+        _orderClient.OnOrderStatus += OnOrderStatus;
+        _dataClient.OnAccountUpdate += OnAccountUpdate;
     }
 
     /// <summary>
@@ -146,9 +149,9 @@ public class GCStrategyEngine
         _isRunning = false;
 
         // Unsubscribe from events to prevent memory leak
-        _client.OnRealtimeBar -= OnBar;
-        _client.OnOrderStatus -= OnOrderStatus;
-        _client.OnAccountUpdate -= OnAccountUpdate;
+        _dataClient.OnRealtimeBar -= OnBar;
+        _orderClient.OnOrderStatus -= OnOrderStatus;
+        _dataClient.OnAccountUpdate -= OnAccountUpdate;
 
         Log("Strategy stopped");
     }
@@ -285,7 +288,7 @@ public class GCStrategyEngine
         Log($"ENTRY SIGNAL - Price: {bar.Close:F2}, Stop: {_stopPrice:F2}, Target: {_targetPrice:F2}, Qty: {_positionQuantity}, Confirmations: {confirmations}");
 
         _pendingEntry = true;  // Mark as pending until fill confirmed
-        _client.PlaceMarketOrder("BUY", _positionQuantity, _strategyName);
+        _orderClient.PlaceMarketOrder("BUY", _positionQuantity, _strategyName);
     }
 
     private bool DetectBullishDivergence()
@@ -483,7 +486,7 @@ public class GCStrategyEngine
 
         Log($"Closing position - Qty: {_positionQuantity}, Reason: {reason}");
         _pendingExit = true;  // Mark as pending until fill confirmed
-        _client.PlaceMarketOrder("SELL", _positionQuantity, $"{_strategyName}_{reason}");
+        _orderClient.PlaceMarketOrder("SELL", _positionQuantity, $"{_strategyName}_{reason}");
     }
 
     private void OnOrderStatus(OrderStatusData status)

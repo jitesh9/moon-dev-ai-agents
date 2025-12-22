@@ -38,7 +38,8 @@ public class MTFStrategyState : StrategyState
 /// </summary>
 public class MTFStrategyEngine
 {
-    private readonly IBKRClient _client;
+    private readonly IBKRClient _dataClient;      // For market data (always real IBKR)
+    private readonly IOrderClient _orderClient;   // For orders (real or paper)
     private readonly MTFStrategyConfig _config;
     private readonly MultiTimeframeBarManager _mtfManager;
 
@@ -99,9 +100,10 @@ public class MTFStrategyEngine
     public event Action<MTFStrategyState>? OnStateChanged;
     public event Action<MTFAlignmentResult>? OnAlignmentUpdated;
 
-    public MTFStrategyEngine(IBKRClient client, MTFStrategyConfig config, MTFStrategyState? savedState = null)
+    public MTFStrategyEngine(IBKRClient dataClient, IOrderClient orderClient, MTFStrategyConfig config, MTFStrategyState? savedState = null)
     {
-        _client = client;
+        _dataClient = dataClient;
+        _orderClient = orderClient;
         _config = config;
 
         // Create MTF manager with config parameters
@@ -125,9 +127,9 @@ public class MTFStrategyEngine
             Log($"Restored position state - Direction: {(_positionDirection == 1 ? "LONG" : "SHORT")}, Entry: {_entryPrice:F2}");
         }
 
-        _client.OnRealtimeBar += OnBar;
-        _client.OnOrderStatus += OnOrderStatus;
-        _client.OnAccountUpdate += OnAccountUpdate;
+        _dataClient.OnRealtimeBar += OnBar;
+        _orderClient.OnOrderStatus += OnOrderStatus;
+        _dataClient.OnAccountUpdate += OnAccountUpdate;
     }
 
     /// <summary>
@@ -166,9 +168,9 @@ public class MTFStrategyEngine
         _isRunning = false;
 
         // Unsubscribe from events
-        _client.OnRealtimeBar -= OnBar;
-        _client.OnOrderStatus -= OnOrderStatus;
-        _client.OnAccountUpdate -= OnAccountUpdate;
+        _dataClient.OnRealtimeBar -= OnBar;
+        _orderClient.OnOrderStatus -= OnOrderStatus;
+        _dataClient.OnAccountUpdate -= OnAccountUpdate;
 
         Log("MTF Strategy stopped");
     }
@@ -286,7 +288,7 @@ public class MTFStrategyEngine
         Log($"  Confirmations: {confirmations}");
 
         _pendingEntry = true;
-        _client.PlaceMarketOrder("BUY", (decimal)quantity, _config.Name);
+        _orderClient.PlaceMarketOrder("BUY", (decimal)quantity, _config.Name);
     }
 
     private void CheckShortEntry(BarData bar, MTFAlignmentResult alignment)
@@ -315,7 +317,7 @@ public class MTFStrategyEngine
         Log($"  Confirmations: {confirmations}");
 
         _pendingEntry = true;
-        _client.PlaceMarketOrder("SELL", (decimal)quantity, _config.Name);
+        _orderClient.PlaceMarketOrder("SELL", (decimal)quantity, _config.Name);
     }
 
     private bool DetectBullishDivergence()
@@ -528,7 +530,7 @@ public class MTFStrategyEngine
         if (_positionQuantity <= 0 || _pendingExit) return;
 
         _pendingExit = true;
-        _client.PlaceMarketOrder(action, _positionQuantity, _config.Name);
+        _orderClient.PlaceMarketOrder(action, _positionQuantity, _config.Name);
     }
 
     private void OnOrderStatus(OrderStatusData status)

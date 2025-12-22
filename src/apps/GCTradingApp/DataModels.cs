@@ -58,6 +58,13 @@ public class AppState
     public int MTFSize { get; set; } = 1;
     public bool MTFAllowShorts { get; set; } = false;
     public MTFStrategyState? MTFState { get; set; }
+
+    // Paper Trading settings
+    public bool PaperTradingEnabled { get; set; } = false;
+    public double PaperSlippageBps { get; set; } = 1.0;
+    public int PaperFillDelayMs { get; set; } = 100;
+    public double PaperInitialBalance { get; set; } = 100000;
+    public PaperTradingState? PaperState { get; set; }
 }
 
 /// <summary>

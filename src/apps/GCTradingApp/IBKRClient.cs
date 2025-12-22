@@ -10,7 +10,7 @@ namespace GCTradingApp;
 /// <summary>
 /// IBKR TWS API Client wrapper with event-based callbacks
 /// </summary>
-public class IBKRClient : EWrapper
+public class IBKRClient : EWrapper, IOrderClient
 {
     private EClientSocket _clientSocket;
     private EReaderSignal _readerSignal;
