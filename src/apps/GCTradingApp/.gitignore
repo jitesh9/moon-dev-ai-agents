@@ -1,0 +1,19 @@
+# Build outputs
+bin/
+obj/
+
+# Logs
+logs/
+
+# User-specific files
+*.user
+*.suo
+.vs/
+
+# State file (contains connection settings)
+gc_trading_state.json
+
+# IDE
+.idea/
+*.swp
+*~
