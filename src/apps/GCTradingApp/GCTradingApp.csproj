@@ -21,7 +21,7 @@
 
   <ItemGroup>
     <Reference Include="CSharpAPI">
-      <HintPath>C:\TWS API\source\CSharpClient\client\bin\Release\netstandard2.0\CSharpAPI.dll</HintPath>
+      <HintPath>lib\CSharpAPI.dll</HintPath>
     </Reference>
   </ItemGroup>
 
