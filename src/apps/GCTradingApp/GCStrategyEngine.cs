@@ -178,32 +178,43 @@ public class GCStrategyEngine
     {
         if (!_isRunning) return;
 
-        int barCount;
-        lock (_barsLock)
+        try
         {
-            // Store bar data
-            _bars.Add(bar);
-            if (_bars.Count > _lookback) _bars.RemoveAt(0);
-            barCount = _bars.Count;
+            int barCount;
+            lock (_barsLock)
+            {
+                // Store bar data
+                _bars.Add(bar);
+                if (_bars.Count > _lookback) _bars.RemoveAt(0);
+                barCount = _bars.Count;
+            }
+
+            // Need enough bars for indicators
+            if (barCount < 50) return;
+
+            // Calculate indicators (takes snapshot inside lock)
+            CalculateIndicators();
+
+            // Check if it's regular trading hours (8 AM - 5 PM)
+            var hour = bar.Time.Hour;
+            bool inTradingHours = hour >= 8 && hour < 17;
+
+            if (_inPosition && !_pendingExit)
+            {
+                ManagePosition(bar);
+            }
+            else if (!_inPosition && !_pendingEntry && inTradingHours)
+            {
+                CheckEntry(bar);
+            }
         }
-
-        // Need enough bars for indicators
-        if (barCount < 50) return;
-
-        // Calculate indicators (takes snapshot inside lock)
-        CalculateIndicators();
-
-        // Check if it's regular trading hours (8 AM - 5 PM)
-        var hour = bar.Time.Hour;
-        bool inTradingHours = hour >= 8 && hour < 17;
-
-        if (_inPosition && !_pendingExit)
+        catch (Exception ex)
         {
-            ManagePosition(bar);
-        }
-        else if (!_inPosition && !_pendingEntry && inTradingHours)
-        {
-            CheckEntry(bar);
+            Log($"ERROR in ProcessBar: {ex.Message}");
+            Logger.Error($"Error processing bar in {_strategyName}", ex);
+            // Re-throw to let circuit breaker handle it
+            // This allows circuit breaker to track failures and disable strategy if needed
+            throw;
         }
     }
 

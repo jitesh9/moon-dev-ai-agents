@@ -82,6 +82,11 @@ public partial class MainForm : Form
     private GCStrategyEngine? _conservativeEngine;
     private MTFStrategyEngine? _mtfEngine;
 
+    // Circuit breakers for each strategy
+    private CircuitBreaker? _aggressiveCircuitBreaker;
+    private CircuitBreaker? _conservativeCircuitBreaker;
+    private CircuitBreaker? _mtfCircuitBreaker;
+
     // MTF UI Controls
     private CheckBox chkMTF_5m15m1H = null!;
     private CheckBox chkMTF_1m5m15m = null!;
@@ -794,14 +799,27 @@ public partial class MainForm : Form
 
     /// <summary>
     /// Gets the order client to use based on current trading mode
+    /// Wraps with RiskAwareOrderClient to enforce risk checks
     /// </summary>
-    private IOrderClient GetOrderClient()
+    private IOrderClient GetOrderClient(string strategyName)
     {
+        IOrderClient baseClient;
         if (rbPaperTrading.Checked && _paperClient != null)
         {
-            return _paperClient;
+            baseClient = _paperClient;
         }
-        return _ibClient!;
+        else
+        {
+            baseClient = _ibClient!;
+        }
+
+        // Wrap with risk-aware client if risk manager is available
+        if (_riskManager != null)
+        {
+            return new RiskAwareOrderClient(baseClient, _riskManager, strategyName);
+        }
+
+        return baseClient;
     }
 
     private void IbClient_OnConnected()
@@ -1368,11 +1386,118 @@ public partial class MainForm : Form
     private void IbClient_OnRealtimeBar(BarData bar)
     {
         // Forward bar to paper trading client for stop order processing
-        _paperClient?.ProcessBar(bar);
+        try
+        {
+            _paperClient?.ProcessBar(bar);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Error processing bar in paper trading client", ex);
+            LogError("Paper trading client error", ex);
+        }
 
-        // Forward to strategy engines
-        _aggressiveEngine?.ProcessBar(bar);
-        _conservativeEngine?.ProcessBar(bar);
+        // Forward to strategy engines with circuit breaker protection
+        if (_aggressiveEngine != null && _aggressiveCircuitBreaker != null)
+        {
+            try
+            {
+                var executed = _aggressiveCircuitBreaker.Execute(() =>
+                {
+                    _aggressiveEngine.ProcessBar(bar);
+                });
+
+                if (!executed)
+                {
+                    // Circuit breaker blocked the operation
+                    Log($"[CIRCUIT BREAKER] Aggressive strategy blocked - circuit is OPEN", LogLevel.Warn);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Exception was logged by circuit breaker, but we still log here for visibility
+                Logger.Error("Exception in aggressive strategy (circuit breaker handled)", ex);
+                LogError("Aggressive strategy exception", ex);
+            }
+        }
+        else if (_aggressiveEngine != null)
+        {
+            // Fallback if circuit breaker not initialized
+            try
+            {
+                _aggressiveEngine.ProcessBar(bar);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error processing bar in aggressive strategy", ex);
+                LogError("Aggressive strategy error", ex);
+            }
+        }
+
+        if (_conservativeEngine != null && _conservativeCircuitBreaker != null)
+        {
+            try
+            {
+                var executed = _conservativeCircuitBreaker.Execute(() =>
+                {
+                    _conservativeEngine.ProcessBar(bar);
+                });
+
+                if (!executed)
+                {
+                    Log($"[CIRCUIT BREAKER] Conservative strategy blocked - circuit is OPEN", LogLevel.Warn);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Exception in conservative strategy (circuit breaker handled)", ex);
+                LogError("Conservative strategy exception", ex);
+            }
+        }
+        else if (_conservativeEngine != null)
+        {
+            try
+            {
+                _conservativeEngine.ProcessBar(bar);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error processing bar in conservative strategy", ex);
+                LogError("Conservative strategy error", ex);
+            }
+        }
+
+        if (_mtfEngine != null && _mtfCircuitBreaker != null)
+        {
+            try
+            {
+                var executed = _mtfCircuitBreaker.Execute(() =>
+                {
+                    _mtfEngine.ProcessBar(bar);
+                });
+
+                if (!executed)
+                {
+                    Log($"[CIRCUIT BREAKER] MTF strategy blocked - circuit is OPEN", LogLevel.Warn);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Exception in MTF strategy (circuit breaker handled)", ex);
+                LogError("MTF strategy exception", ex);
+            }
+        }
+        else if (_mtfEngine != null)
+        {
+            try
+            {
+                _mtfEngine.ProcessBar(bar);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error processing bar in MTF strategy", ex);
+                LogError("MTF strategy error", ex);
+            }
+        }
     }
 
     private void BtnStartStrategy_Click(object? sender, EventArgs e)
@@ -1391,9 +1516,24 @@ public partial class MainForm : Form
             // Restore saved state if available
             StrategyState? savedState = _state.AggressiveState?.InPosition == true ? _state.AggressiveState : null;
 
+            // Create circuit breaker for aggressive strategy
+            _aggressiveCircuitBreaker = new CircuitBreaker("Aggressive", new CircuitBreakerConfig
+            {
+                FailureThreshold = 5,
+                TimeWindowSeconds = 60,
+                TimeoutSeconds = 30,
+                SuccessThreshold = 2
+            });
+            _aggressiveCircuitBreaker.OnStateChanged += (name, state) =>
+            {
+                Log($"[CIRCUIT BREAKER] {name} state changed to {state}", 
+                    state == CircuitState.Open ? LogLevel.Error : LogLevel.Warn);
+            };
+            _aggressiveCircuitBreaker.OnLog += msg => Log($"[CIRCUIT] {msg}");
+
             _aggressiveEngine = new GCStrategyEngine(
                 _ibClient!,
-                GetOrderClient(),  // Use paper or real based on mode
+                GetOrderClient("Aggressive"),  // Use paper or real based on mode, wrapped with risk checks
                 "Aggressive",
                 0.99,  // 99% position scale
                 false, // No DD protection
@@ -1412,9 +1552,24 @@ public partial class MainForm : Form
             // Restore saved state if available
             StrategyState? savedState = _state.ConservativeState?.InPosition == true ? _state.ConservativeState : null;
 
+            // Create circuit breaker for conservative strategy
+            _conservativeCircuitBreaker = new CircuitBreaker("Conservative", new CircuitBreakerConfig
+            {
+                FailureThreshold = 5,
+                TimeWindowSeconds = 60,
+                TimeoutSeconds = 30,
+                SuccessThreshold = 2
+            });
+            _conservativeCircuitBreaker.OnStateChanged += (name, state) =>
+            {
+                Log($"[CIRCUIT BREAKER] {name} state changed to {state}",
+                    state == CircuitState.Open ? LogLevel.Error : LogLevel.Warn);
+            };
+            _conservativeCircuitBreaker.OnLog += msg => Log($"[CIRCUIT] {msg}");
+
             _conservativeEngine = new GCStrategyEngine(
                 _ibClient!,
-                GetOrderClient(),  // Use paper or real based on mode
+                GetOrderClient("Conservative"),  // Use paper or real based on mode, wrapped with risk checks
                 "Conservative",
                 0.62,  // 62% position scale
                 true,  // DD protection enabled
@@ -1505,7 +1660,22 @@ public partial class MainForm : Form
             AllowShorts = chkMTFAllowShorts.Checked
         };
 
-        _mtfEngine = new MTFStrategyEngine(_ibClient!, GetOrderClient(), config, savedState);
+        // Create circuit breaker for MTF strategy
+        _mtfCircuitBreaker = new CircuitBreaker($"MTF_{presetName}", new CircuitBreakerConfig
+        {
+            FailureThreshold = 5,
+            TimeWindowSeconds = 60,
+            TimeoutSeconds = 30,
+            SuccessThreshold = 2
+        });
+        _mtfCircuitBreaker.OnStateChanged += (name, state) =>
+        {
+            Log($"[CIRCUIT BREAKER] {name} state changed to {state}",
+                state == CircuitState.Open ? LogLevel.Error : LogLevel.Warn);
+        };
+        _mtfCircuitBreaker.OnLog += msg => Log($"[CIRCUIT] {msg}");
+
+        _mtfEngine = new MTFStrategyEngine(_ibClient!, GetOrderClient(config.Name), config, savedState);
         _mtfEngine.OnLog += msg => Log(msg);
         _mtfEngine.OnStateChanged += OnMTFStateChanged;
         _mtfEngine.OnAlignmentUpdated += OnMTFAlignmentUpdated;
@@ -1608,6 +1778,14 @@ public partial class MainForm : Form
         _aggressiveEngine = null;
         _conservativeEngine = null;
         _mtfEngine = null;
+        
+        // Reset circuit breakers
+        _aggressiveCircuitBreaker?.Reset();
+        _conservativeCircuitBreaker?.Reset();
+        _mtfCircuitBreaker?.Reset();
+        _aggressiveCircuitBreaker = null;
+        _conservativeCircuitBreaker = null;
+        _mtfCircuitBreaker = null;
 
         if (InvokeRequired)
         {

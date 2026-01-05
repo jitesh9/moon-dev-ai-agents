@@ -191,46 +191,57 @@ public class MTFStrategyEngine
 
     private void ProcessBar(BarData bar)
     {
-        _barCount++;
-
-        // Store bar for divergence calculations
-        lock (_barsLock)
+        try
         {
-            _bars.Add(bar);
-            while (_bars.Count > _lookback)
-                _bars.RemoveAt(0);
-        }
+            _barCount++;
 
-        // Forward to MTF manager for aggregation
-        _mtfManager.ProcessBar(bar);
-
-        // Calculate indicators from 5-second bars (for entry timing)
-        CalculateIndicators();
-
-        // Check if MTF manager is warmed up
-        if (!_mtfManager.IsWarmedUp())
-        {
-            return;  // Wait for enough bars
-        }
-
-        // Get MTF alignment
-        var alignment = _mtfManager.GetAlignment();
-
-        // Process entry or position management
-        if (!_inPosition && !_pendingEntry && !_pendingExit)
-        {
-            if (alignment.AllBullish)
+            // Store bar for divergence calculations
+            lock (_barsLock)
             {
-                CheckLongEntry(bar, alignment);
+                _bars.Add(bar);
+                while (_bars.Count > _lookback)
+                    _bars.RemoveAt(0);
             }
-            else if (alignment.AllBearish && _config.AllowShorts)
+
+            // Forward to MTF manager for aggregation
+            _mtfManager.ProcessBar(bar);
+
+            // Calculate indicators from 5-second bars (for entry timing)
+            CalculateIndicators();
+
+            // Check if MTF manager is warmed up
+            if (!_mtfManager.IsWarmedUp())
             {
-                CheckShortEntry(bar, alignment);
+                return;  // Wait for enough bars
+            }
+
+            // Get MTF alignment
+            var alignment = _mtfManager.GetAlignment();
+
+            // Process entry or position management
+            if (!_inPosition && !_pendingEntry && !_pendingExit)
+            {
+                if (alignment.AllBullish)
+                {
+                    CheckLongEntry(bar, alignment);
+                }
+                else if (alignment.AllBearish && _config.AllowShorts)
+                {
+                    CheckShortEntry(bar, alignment);
+                }
+            }
+            else if (_inPosition && !_pendingExit)
+            {
+                ManagePosition(bar);
             }
         }
-        else if (_inPosition && !_pendingExit)
+        catch (Exception ex)
         {
-            ManagePosition(bar);
+            Log($"ERROR in ProcessBar: {ex.Message}");
+            Logger.Error($"Error processing bar in {_config.Name}", ex);
+            // Re-throw to let circuit breaker handle it
+            // This allows circuit breaker to track failures and disable strategy if needed
+            throw;
         }
     }
 
