@@ -41,6 +41,8 @@ public partial class MainForm : Form
     private RadioButton rdoCapital = null!;
     private NumericUpDown numAggressiveSize = null!;
     private NumericUpDown numConservativeSize = null!;
+    private NumericUpDown numTradingHoursStart = null!;
+    private NumericUpDown numTradingHoursEnd = null!;
     private Button btnStartStrategy = null!;
     private Button btnStopStrategy = null!;
     private Label lblStrategyStatus = null!;
@@ -62,6 +64,16 @@ public partial class MainForm : Form
     private Label lblEquity = null!;
     private Label lblPnL = null!;
     private Label lblDrawdown = null!;
+    
+    // Price Display UI
+    private Label lblPrice = null!;
+    private Label lblPriceLabel = null!;
+    private Label lblOHLC = null!;
+    private Label lblOHLCLabel = null!;
+    private Label lblLastUpdate = null!;
+    private BarData? _latestBar;
+    private readonly object _latestBarLock = new();
+    private System.Windows.Forms.Timer? _priceUpdateTimer;
 
     // Performance Dashboard UI
     private Label lblWinRate = null!;
@@ -81,6 +93,11 @@ public partial class MainForm : Form
     private GCStrategyEngine? _aggressiveEngine;
     private GCStrategyEngine? _conservativeEngine;
     private MTFStrategyEngine? _mtfEngine;
+
+    // Historical data management
+    private HistoricalBarRequestManager? _historicalBarManager;
+    private HistoricalDataStorage? _historicalStorage;
+    private List<BarData> _loadedHistoricalBars = new(); // Store loaded bars to feed to strategies when they start
 
     // Simulation
     private SimulationEngine? _simulationEngine;
@@ -147,6 +164,15 @@ public partial class MainForm : Form
 
             this.FormClosing += MainForm_FormClosing;
 
+            // Initialize price update timer (updates every 1 second)
+            _priceUpdateTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 1000, // 1 second
+                Enabled = true
+            };
+            _priceUpdateTimer.Tick += (s, e) => UpdatePriceDisplay();
+            _priceUpdateTimer.Start();
+
             Logger.Info("MainForm constructor completed successfully");
         }
         catch (Exception ex)
@@ -171,7 +197,7 @@ public partial class MainForm : Form
             RowCount = 2,
             Padding = new Padding(10)
         };
-        mainPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 260));  // Increased for risk controls
+        mainPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 290));  // Increased for risk controls and trading hours
         mainPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         // Top panel - Connection and Strategy Settings
@@ -229,33 +255,109 @@ public partial class MainForm : Form
 
         grpStatus.Controls.AddRange(new Control[] { lblStatus, lblReconnect, lblEquity, lblPnL, lblDrawdown });
 
+        // Price Display Group (5-second bars) - Prominent location
+        var grpPrice = new GroupBox
+        {
+            Text = "GC Futures Price (5-sec bars)",
+            Location = new Point(910, 0),
+            Size = new Size(270, 130)
+        };
+
+        lblPriceLabel = new Label { Text = "GC Price:", Location = new Point(10, 15), AutoSize = true, Font = new Font(this.Font.FontFamily, 9f, FontStyle.Bold) };
+        lblPrice = new Label 
+        { 
+            Text = "--", 
+            Location = new Point(10, 35), 
+            AutoSize = false, 
+            Font = new Font(this.Font.FontFamily, 28f, FontStyle.Bold),
+            ForeColor = Color.Blue,
+            Width = 250,
+            Height = 40,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        lblOHLCLabel = new Label { Text = "5-sec Bar OHLC:", Location = new Point(10, 80), AutoSize = true, Font = new Font(this.Font.FontFamily, 8f, FontStyle.Bold) };
+        lblOHLC = new Label 
+        { 
+            Text = "O: --  H: --  L: --  C: --", 
+            Location = new Point(10, 95), 
+            AutoSize = true,
+            Font = new Font(this.Font.FontFamily, 8.5f)
+        };
+
+        lblLastUpdate = new Label 
+        { 
+            Text = "Last: --", 
+            Location = new Point(180, 80), 
+            AutoSize = true,
+            Font = new Font(this.Font.FontFamily, 7.5f),
+            ForeColor = Color.Gray
+        };
+
+        grpPrice.Controls.AddRange(new Control[] { lblPriceLabel, lblPrice, lblOHLCLabel, lblOHLC, lblLastUpdate });
+
         // Strategy Settings Group
         var grpStrategy = new GroupBox
         {
             Text = "Strategy Settings",
             Location = new Point(620, 0),
-            Size = new Size(550, 100)
+            Size = new Size(280, 130)
         };
 
         chkAggressive = new CheckBox { Text = "Aggressive (99%,NoDDLimit)", Location = new Point(10, 22), AutoSize = true, Checked = _state.AggressiveEnabled };
         chkConservative = new CheckBox { Text = "Conservative (11% MaxDD)", Location = new Point(10, 48), AutoSize = true, Checked = _state.ConservativeEnabled };
 
-        rdoContracts = new RadioButton { Text = "Contracts", Location = new Point(280, 22), AutoSize = true, Checked = _state.SizingMode == "Contracts" };
-        rdoCapital = new RadioButton { Text = "Capital ($)", Location = new Point(280, 48), AutoSize = true, Checked = _state.SizingMode == "Capital" };
+        rdoContracts = new RadioButton { Text = "Contracts", Location = new Point(10, 74), AutoSize = true, Checked = _state.SizingMode == "Contracts" };
+        rdoCapital = new RadioButton { Text = "Capital ($)", Location = new Point(100, 74), AutoSize = true, Checked = _state.SizingMode == "Capital" };
 
-        var lblAggSize = new Label { Text = "Agg:", Location = new Point(390, 25), AutoSize = true };
-        numAggressiveSize = new NumericUpDown { Location = new Point(450, 22), Width = 80, Minimum = 1, Maximum = 1000000, Value = (decimal)_state.AggressiveSize, DecimalPlaces = 0 };
+        var lblAggSize = new Label { Text = "Agg:", Location = new Point(180, 25), AutoSize = true };
+        numAggressiveSize = new NumericUpDown { Location = new Point(220, 22), Width = 50, Minimum = 1, Maximum = 1000000, Value = (decimal)_state.AggressiveSize, DecimalPlaces = 0 };
 
-        var lblConsSize = new Label { Text = "Cons:", Location = new Point(390, 51), AutoSize = true };
-        numConservativeSize = new NumericUpDown { Location = new Point(450, 48), Width = 80, Minimum = 1, Maximum = 1000000, Value = (decimal)_state.ConservativeSize, DecimalPlaces = 0 };
+        var lblConsSize = new Label { Text = "Cons:", Location = new Point(180, 51), AutoSize = true };
+        numConservativeSize = new NumericUpDown { Location = new Point(220, 48), Width = 50, Minimum = 1, Maximum = 1000000, Value = (decimal)_state.ConservativeSize, DecimalPlaces = 0 };
 
-        grpStrategy.Controls.AddRange(new Control[] { chkAggressive, chkConservative, rdoContracts, rdoCapital, lblAggSize, numAggressiveSize, lblConsSize, numConservativeSize });
+        // Trading Hours Controls
+        var lblTradingHours = new Label { Text = "Hours:", Location = new Point(10, 100), AutoSize = true };
+        var lblStartTime = new Label { Text = "Start:", Location = new Point(60, 100), AutoSize = true };
+        numTradingHoursStart = new NumericUpDown 
+        { 
+            Location = new Point(100, 97), 
+            Width = 40, 
+            Minimum = 0, 
+            Maximum = 23, 
+            Value = _state.TradingHoursStart,
+            DecimalPlaces = 0
+        };
+        var lblEndTime = new Label { Text = "End:", Location = new Point(150, 100), AutoSize = true };
+        numTradingHoursEnd = new NumericUpDown 
+        { 
+            Location = new Point(180, 97), 
+            Width = 40, 
+            Minimum = 0, 
+            Maximum = 23, 
+            Value = _state.TradingHoursEnd,
+            DecimalPlaces = 0
+        };
+        var lblTradingHoursNote = new Label 
+        { 
+            Text = "(Overnight OK)", 
+            Location = new Point(230, 100), 
+            AutoSize = true,
+            ForeColor = Color.Gray,
+            Font = new Font(this.Font.FontFamily, 7.5f)
+        };
+
+        grpStrategy.Controls.AddRange(new Control[] { 
+            chkAggressive, chkConservative, rdoContracts, rdoCapital, 
+            lblAggSize, numAggressiveSize, lblConsSize, numConservativeSize,
+            lblTradingHours, lblStartTime, numTradingHoursStart, lblEndTime, numTradingHoursEnd, lblTradingHoursNote
+        });
 
         // Control Buttons Group
         var grpControls = new GroupBox
         {
             Text = "Controls",
-            Location = new Point(1180, 0),
+            Location = new Point(1190, 0),
             Size = new Size(200, 100)
         };
 
@@ -400,7 +502,7 @@ public partial class MainForm : Form
 
         grpPaperMode.Controls.AddRange(new Control[] { rbLiveTrading, rbPaperTrading, lblPaperPnL });
 
-        panel.Controls.AddRange(new Control[] { grpConnection, grpStatus, grpStrategy, grpControls, grpRisk, grpEmergency, grpMTF, grpContract, grpPaperMode, grpPaperSettings });
+        panel.Controls.AddRange(new Control[] { grpConnection, grpStatus, grpPrice, grpStrategy, grpControls, grpRisk, grpEmergency, grpMTF, grpContract, grpPaperMode, grpPaperSettings });
 
         return panel;
     }
@@ -1060,14 +1162,124 @@ public partial class MainForm : Form
         Logger.Debug("Requesting account updates...");
         _ibClient?.RequestAccountUpdates();
 
-        // Subscribe to GC market data
-        Logger.Debug("Subscribing to GC market data...");
-        _ibClient?.SubscribeToGCData();
+        // Initialize historical data storage and manager
+        _historicalStorage = new HistoricalDataStorage();
+        _historicalBarManager = new HistoricalBarRequestManager(_ibClient!, _historicalStorage);
+        _historicalBarManager.OnAllDataLoaded += OnHistoricalDataLoaded;
+        _historicalBarManager.OnError += msg => Log($"[HISTORICAL] Error: {msg}", LogLevel.Warn);
+
+        // Calculate requirements based on active strategies
+        bool aggressiveEnabled = chkAggressive.Checked;
+        bool conservativeEnabled = chkConservative.Checked;
+        MTFStrategyConfig? mtfConfig = GetActiveMTFConfig();
+
+        var requirements = HistoricalBarRequestManager.CalculateRequirements(
+            aggressiveEnabled,
+            conservativeEnabled,
+            mtfConfig);
+
+        // Request historical data (will load from cache first, then request from API if needed)
+        Log("[HISTORICAL] Requesting historical data...");
+        _historicalBarManager.RequestHistoricalData(requirements);
+
+        // Don't subscribe to realtime yet - wait for historical data to load
+        // Realtime subscription will happen in OnHistoricalDataLoaded
 
         // Perform position reconciliation if we have saved state
         _ = PerformPositionReconciliationAsync();
 
-        Logger.Info("Connection setup completed");
+        Logger.Info("Connection setup completed - waiting for historical data");
+    }
+
+    /// <summary>
+    /// Get active MTF configuration from UI settings
+    /// </summary>
+    private MTFStrategyConfig? GetActiveMTFConfig()
+    {
+        TimeframePreset? selectedPreset = null;
+        string presetName = "";
+
+        if (chkMTF_5m15m1H.Checked)
+        {
+            selectedPreset = TimeframePreset.Preset_5m_15m_1H;
+            presetName = "MTF_5m15m1H";
+        }
+        else if (chkMTF_1m5m15m.Checked)
+        {
+            selectedPreset = TimeframePreset.Preset_1m_5m_15m;
+            presetName = "MTF_1m5m15m";
+        }
+        else if (chkMTF_15m1H4H.Checked)
+        {
+            selectedPreset = TimeframePreset.Preset_15m_1H_4H;
+            presetName = "MTF_15m1H4H";
+        }
+        else if (chkMTF_5m1HDaily.Checked)
+        {
+            selectedPreset = TimeframePreset.Preset_5m_1H_Daily;
+            presetName = "MTF_5m1HDaily";
+        }
+
+        if (selectedPreset == null)
+            return null;
+
+        return new MTFStrategyConfig
+        {
+            Name = presetName,
+            TimeframePreset = selectedPreset.Value,
+            PositionScale = 0.80,
+            DrawdownProtection = true,
+            MaxDrawdown = 0.11,
+            FixedContracts = (int)numMTFSize.Value,
+            AllowShorts = chkMTFAllowShorts.Checked
+        };
+    }
+
+    /// <summary>
+    /// Handle historical data loaded event - feed bars to strategies and start realtime
+    /// </summary>
+    private void OnHistoricalDataLoaded()
+    {
+        if (InvokeRequired)
+        {
+            Invoke(new Action(OnHistoricalDataLoaded));
+            return;
+        }
+
+        try
+        {
+            Logger.Info("Historical data loaded - feeding to strategies");
+
+            if (_historicalBarManager == null)
+            {
+                Logger.Warn("Historical bar manager is null");
+                return;
+            }
+
+            // Get all collected bars (sorted chronologically)
+            var bars = _historicalBarManager.GetCollectedBars();
+            Logger.Info($"Loaded {bars.Count} historical bars");
+
+            // Store bars to feed to strategies when they start
+            _loadedHistoricalBars = bars;
+
+            // Feed bars to strategies if they already exist (they might be started already)
+            FeedHistoricalBarsToStrategies(bars);
+
+            // Now subscribe to realtime bars
+            Logger.Debug("Subscribing to GC realtime market data...");
+            _ibClient?.SubscribeToGCData();
+
+            Log($"[HISTORICAL] Loaded and fed {bars.Count} historical bars to strategies");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Failed to process historical data", ex);
+            LogError("Failed to process historical data", ex);
+            
+            // Still subscribe to realtime even if historical processing failed
+            _ibClient?.SubscribeToGCData();
+        }
     }
 
     private async Task PerformPositionReconciliationAsync()
@@ -1537,6 +1749,15 @@ public partial class MainForm : Form
 
     private void IbClient_OnRealtimeBar(BarData bar)
     {
+        // Store latest bar for price display
+        lock (_latestBarLock)
+        {
+            _latestBar = bar;
+        }
+
+        // Update price display immediately
+        UpdatePriceDisplay();
+
         // Forward bar to paper trading client for stop order processing
         _paperClient?.ProcessBar(bar);
 
@@ -1569,6 +1790,9 @@ public partial class MainForm : Form
                 false, // No DD protection
                 useContracts ? (int)numAggressiveSize.Value : 0,
                 useContracts ? 0 : (double)numAggressiveSize.Value,
+                maxDrawdown: 0.11,
+                tradingHoursStart: (int)numTradingHoursStart.Value,
+                tradingHoursEnd: (int)numTradingHoursEnd.Value,
                 savedState: savedState
             );
             _aggressiveEngine.OnLog += msg => Log($"[AGG] {msg}");
@@ -1581,6 +1805,16 @@ public partial class MainForm : Form
             _simulationForm?.RegisterStrategy("Aggressive");
             
             Log("Aggressive strategy started" + (savedState != null ? " (restored position)" : ""));
+            
+            // Immediately evaluate entry conditions to update UI
+            BarData? latestBar;
+            lock (_latestBarLock)
+            {
+                latestBar = _latestBar;
+            }
+            // Evaluate conditions (will use internal bars if latestBar is null)
+            var conditionsResult = _aggressiveEngine.EvaluateEntryConditions(latestBar);
+            OnAggressiveConditionsUpdated(conditionsResult);
         }
 
         if (chkConservative.Checked)
@@ -1597,6 +1831,8 @@ public partial class MainForm : Form
                 useContracts ? (int)numConservativeSize.Value : 0,
                 useContracts ? 0 : (double)numConservativeSize.Value,
                 maxDrawdown: 0.11,  // 11% max DD
+                tradingHoursStart: (int)numTradingHoursStart.Value,
+                tradingHoursEnd: (int)numTradingHoursEnd.Value,
                 savedState: savedState
             );
             _conservativeEngine.OnLog += msg => Log($"[CONS] {msg}");
@@ -1609,10 +1845,27 @@ public partial class MainForm : Form
             _simulationForm?.RegisterStrategy("Conservative");
             
             Log("Conservative strategy started" + (savedState != null ? " (restored position)" : ""));
+            
+            // Immediately evaluate entry conditions to update UI
+            BarData? latestBar;
+            lock (_latestBarLock)
+            {
+                latestBar = _latestBar;
+            }
+            // Evaluate conditions (will use internal bars if latestBar is null)
+            var conditionsResult = _conservativeEngine.EvaluateEntryConditions(latestBar);
+            OnConservativeConditionsUpdated(conditionsResult);
         }
 
         // Start MTF strategy if any preset is selected
         StartMTFStrategy();
+
+        // Feed historical bars to strategies if they were loaded before strategies started
+        if (_loadedHistoricalBars.Count > 0)
+        {
+            FeedHistoricalBarsToStrategies(_loadedHistoricalBars);
+            Log($"[HISTORICAL] Fed {_loadedHistoricalBars.Count} historical bars to newly started strategies");
+        }
 
         btnStartStrategy.Enabled = false;
         btnStopStrategy.Enabled = true;
@@ -1699,6 +1952,17 @@ public partial class MainForm : Form
         _simulationForm?.RegisterStrategy(presetName);
 
         Log($"MTF strategy started: {presetName}" + (savedState != null ? " (restored position)" : ""));
+        
+        // Immediately evaluate entry conditions to update UI
+        BarData? latestBar;
+        lock (_latestBarLock)
+        {
+            latestBar = _latestBar;
+        }
+        // Evaluate conditions (will use internal bars if latestBar is null)
+        var alignment = _mtfEngine.GetAlignment();
+        var conditionsResult = _mtfEngine.EvaluateEntryConditions(latestBar, alignment);
+        OnMTFConditionsUpdated(conditionsResult);
     }
 
     private void OnMTFStateChanged(StrategyState state)
@@ -1751,6 +2015,68 @@ public partial class MainForm : Form
 
         UpdateConditionsGrid(dgvMTFConditions, result);
         UpdateCanEnterLabel(lblMTFCanEnter, result);
+    }
+
+    /// <summary>
+    /// Updates the price display with the latest bar data
+    /// </summary>
+    private void UpdatePriceDisplay()
+    {
+        if (lblPrice == null || lblOHLC == null || lblLastUpdate == null)
+            return;
+
+        BarData? bar;
+        lock (_latestBarLock)
+        {
+            bar = _latestBar;
+        }
+
+        if (InvokeRequired)
+        {
+            Invoke(() => UpdatePriceDisplay());
+            return;
+        }
+
+        if (bar == null)
+        {
+            lblPrice.Text = "--";
+            lblPrice.ForeColor = Color.Gray;
+            lblOHLC.Text = "O: --  H: --  L: --  C: --";
+            lblLastUpdate.Text = "Last: --";
+            return;
+        }
+
+        // Update price (large font)
+        lblPrice.Text = bar.Close.ToString("F2");
+        
+        // Color code: green if higher than open, red if lower
+        if (bar.Close > bar.Open)
+            lblPrice.ForeColor = Color.Green;
+        else if (bar.Close < bar.Open)
+            lblPrice.ForeColor = Color.Red;
+        else
+            lblPrice.ForeColor = Color.Blue;
+
+        // Update OHLC
+        lblOHLC.Text = $"O: {bar.Open:F2}  H: {bar.High:F2}  L: {bar.Low:F2}  C: {bar.Close:F2}";
+
+        // Update last update time
+        var timeSinceUpdate = DateTime.Now - bar.Time;
+        if (timeSinceUpdate.TotalSeconds < 10)
+        {
+            lblLastUpdate.Text = $"Last: {bar.Time:HH:mm:ss}";
+            lblLastUpdate.ForeColor = Color.Green;
+        }
+        else if (timeSinceUpdate.TotalSeconds < 30)
+        {
+            lblLastUpdate.Text = $"Last: {bar.Time:HH:mm:ss} ({timeSinceUpdate.TotalSeconds:F0}s ago)";
+            lblLastUpdate.ForeColor = Color.Orange;
+        }
+        else
+        {
+            lblLastUpdate.Text = $"Last: {bar.Time:HH:mm:ss} ({timeSinceUpdate.TotalSeconds:F0}s ago)";
+            lblLastUpdate.ForeColor = Color.Red;
+        }
     }
 
     private void UpdateConditionsGrid(DataGridView dgv, EntryConditionsResult result)
@@ -2138,6 +2464,8 @@ public partial class MainForm : Form
                 _state.SizingMode = rdoContracts.Checked ? "Contracts" : "Capital";
                 _state.AggressiveSize = (double)numAggressiveSize.Value;
                 _state.ConservativeSize = (double)numConservativeSize.Value;
+                _state.TradingHoursStart = (int)numTradingHoursStart.Value;
+                _state.TradingHoursEnd = (int)numTradingHoursEnd.Value;
 
                 // Update risk settings from UI
                 _state.RiskSettings.MaxDailyLossUsd = (double)numMaxDailyLoss.Value;
@@ -2180,6 +2508,10 @@ public partial class MainForm : Form
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
     {
         StopStrategies();
+
+        // Stop price update timer
+        _priceUpdateTimer?.Stop();
+        _priceUpdateTimer?.Dispose();
 
         // Send daily summary before closing
         if (_performanceTracker != null && _alertManager != null)

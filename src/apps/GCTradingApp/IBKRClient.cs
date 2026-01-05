@@ -23,6 +23,11 @@ public class IBKRClient : EWrapper, IOrderClient
     private Contract? _gcContract;
     private int _gcReqId = 1001;
 
+    // Historical data request tracking
+    private int _nextHistoricalReqId = 2000; // Use range 2000-2999 for historical requests
+    private readonly Dictionary<int, HistoricalRequestInfo> _activeHistoricalRequests = new();
+    private readonly object _historicalRequestsLock = new();
+
     // Events
     public event Action? OnConnected;
     public event Action? OnDisconnected;
@@ -34,6 +39,7 @@ public class IBKRClient : EWrapper, IOrderClient
     public event Action<string, string, string>? OnAccountUpdate;
     public event Action<BarData>? OnRealtimeBar;
     public event Action<BarData>? OnHistoricalBar;
+    public event Action<int, string, string>? OnHistoricalDataEnd; // reqId, start, end
 
     /// <summary>
     /// Thread-safe order ID generator
@@ -183,9 +189,77 @@ public class IBKRClient : EWrapper, IOrderClient
         _clientSocket.reqRealTimeBars(_gcReqId, _gcContract, 5, "TRADES", false, new List<TagValue>());
     }
 
+    /// <summary>
+    /// Get next available historical data request ID
+    /// </summary>
+    public int NextHistoricalReqId => Interlocked.Increment(ref _nextHistoricalReqId);
+
+    /// <summary>
+    /// Request historical data and track the request
+    /// </summary>
+    public int RequestHistoricalData(string duration, string barSize, string? endDateTime = null)
+    {
+        if (_gcContract == null) return -1;
+
+        var reqId = NextHistoricalReqId;
+        
+        // Track the request
+        lock (_historicalRequestsLock)
+        {
+            _activeHistoricalRequests[reqId] = new HistoricalRequestInfo
+            {
+                ReqId = reqId,
+                BarSize = barSize,
+                Duration = duration,
+                EndDateTime = endDateTime ?? "",
+                CollectedBars = new List<BarData>(),
+                IsComplete = false,
+                StartTime = DateTime.Now
+            };
+        }
+
+        Logger.Info($"Requesting historical data: reqId={reqId}, duration={duration}, barSize={barSize}");
+
+        _clientSocket.reqHistoricalData(
+            reqId,
+            _gcContract,
+            endDateTime ?? "",  // End date/time (empty = now)
+            duration,  // e.g., "1 D", "1 W"
+            barSize,   // e.g., "1 hour", "5 mins"
+            "TRADES",
+            1,  // Use RTH
+            1,  // Format date as string
+            false,
+            new List<TagValue>()
+        );
+
+        return reqId;
+    }
+
+    /// <summary>
+    /// Request historical data with existing reqId (for compatibility)
+    /// </summary>
     public void RequestHistoricalData(int reqId, string duration, string barSize)
     {
         if (_gcContract == null) return;
+
+        // Track the request if not already tracked
+        lock (_historicalRequestsLock)
+        {
+            if (!_activeHistoricalRequests.ContainsKey(reqId))
+            {
+                _activeHistoricalRequests[reqId] = new HistoricalRequestInfo
+                {
+                    ReqId = reqId,
+                    BarSize = barSize,
+                    Duration = duration,
+                    EndDateTime = "",
+                    CollectedBars = new List<BarData>(),
+                    IsComplete = false,
+                    StartTime = DateTime.Now
+                };
+            }
+        }
 
         _clientSocket.reqHistoricalData(
             reqId,
@@ -199,6 +273,40 @@ public class IBKRClient : EWrapper, IOrderClient
             false,
             new List<TagValue>()
         );
+    }
+
+    /// <summary>
+    /// Get information about an active historical request
+    /// </summary>
+    public HistoricalRequestInfo? GetHistoricalRequestInfo(int reqId)
+    {
+        lock (_historicalRequestsLock)
+        {
+            return _activeHistoricalRequests.TryGetValue(reqId, out var info) ? info : null;
+        }
+    }
+
+    /// <summary>
+    /// Get all active historical request IDs
+    /// </summary>
+    public List<int> GetActiveHistoricalRequestIds()
+    {
+        lock (_historicalRequestsLock)
+        {
+            return _activeHistoricalRequests.Keys.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Check if all historical requests are complete
+    /// </summary>
+    public bool AreAllHistoricalRequestsComplete()
+    {
+        lock (_historicalRequestsLock)
+        {
+            if (_activeHistoricalRequests.Count == 0) return true;
+            return _activeHistoricalRequests.Values.All(r => r.IsComplete);
+        }
     }
 
     public void PlaceOrder(string action, decimal quantity, string orderType, double limitPrice = 0, double stopPrice = 0, string orderRef = "")
@@ -441,6 +549,16 @@ public class IBKRClient : EWrapper, IOrderClient
             WAP = bar.WAP,
             Count = bar.Count
         };
+
+        // Track bar in request info
+        lock (_historicalRequestsLock)
+        {
+            if (_activeHistoricalRequests.TryGetValue(reqId, out var requestInfo))
+            {
+                requestInfo.CollectedBars.Add(barData);
+            }
+        }
+
         PostToUI(() => OnHistoricalBar?.Invoke(barData));
     }
 
@@ -474,7 +592,30 @@ public class IBKRClient : EWrapper, IOrderClient
     public void contractDetailsEnd(int reqId) { }
     public void execDetailsEnd(int reqId) { }
     public void fundamentalData(int reqId, string data) { }
-    public void historicalDataEnd(int reqId, string start, string end) { }
+    public void historicalDataEnd(int reqId, string start, string end)
+    {
+        // Mark request as complete
+        lock (_historicalRequestsLock)
+        {
+            if (_activeHistoricalRequests.TryGetValue(reqId, out var requestInfo))
+            {
+                requestInfo.IsComplete = true;
+                requestInfo.EndTime = DateTime.Now;
+                requestInfo.StartDate = start;
+                requestInfo.EndDate = end;
+                
+                var barCount = requestInfo.CollectedBars.Count;
+                Logger.Info($"Historical data request {reqId} completed: {barCount} bars received (start={start}, end={end})");
+            }
+            else
+            {
+                Logger.Warn($"Historical data end received for unknown reqId: {reqId}");
+            }
+        }
+
+        // Fire event
+        PostToUI(() => OnHistoricalDataEnd?.Invoke(reqId, start, end));
+    }
     public void marketDataType(int reqId, int marketDataType) { }
     public void updateMktDepth(int tickerId, int position, int operation, int side, double price, decimal size) { }
     public void updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, decimal size, bool isSmartDepth) { }
@@ -537,4 +678,21 @@ public class IBKRClient : EWrapper, IOrderClient
     public void errorProtoBuf(IBApi.protobuf.ErrorMessage errorMessageProto) { }
     public void execDetailsProtoBuf(IBApi.protobuf.ExecutionDetails executionDetailsProto) { }
     public void execDetailsEndProtoBuf(IBApi.protobuf.ExecutionDetailsEnd executionDetailsEndProto) { }
+}
+
+/// <summary>
+/// Information about an active historical data request
+/// </summary>
+public class HistoricalRequestInfo
+{
+    public int ReqId { get; set; }
+    public string BarSize { get; set; } = "";
+    public string Duration { get; set; } = "";
+    public string EndDateTime { get; set; } = "";
+    public List<BarData> CollectedBars { get; set; } = new();
+    public bool IsComplete { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime? EndTime { get; set; }
+    public string StartDate { get; set; } = "";
+    public string EndDate { get; set; } = "";
 }
