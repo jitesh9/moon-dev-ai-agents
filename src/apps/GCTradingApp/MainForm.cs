@@ -82,6 +82,10 @@ public partial class MainForm : Form
     private GCStrategyEngine? _conservativeEngine;
     private MTFStrategyEngine? _mtfEngine;
 
+    // Simulation
+    private SimulationEngine? _simulationEngine;
+    private SimulationForm? _simulationForm;
+
     // MTF UI Controls
     private CheckBox chkMTF_5m15m1H = null!;
     private CheckBox chkMTF_1m5m15m = null!;
@@ -93,6 +97,14 @@ public partial class MainForm : Form
     private Label lblTF1Status = null!;
     private Label lblTF2Status = null!;
     private Label lblTF3Status = null!;
+
+    // Entry Conditions UI Controls
+    private DataGridView dgvAggressiveConditions = null!;
+    private DataGridView dgvConservativeConditions = null!;
+    private DataGridView dgvMTFConditions = null!;
+    private Label lblAggressiveCanEnter = null!;
+    private Label lblConservativeCanEnter = null!;
+    private Label lblMTFCanEnter = null!;
 
     // Paper Trading
     private PaperTradingClient? _paperClient;
@@ -123,6 +135,15 @@ public partial class MainForm : Form
 
             ApplyStateToUI();
             Logger.Debug("State applied to UI");
+
+            // Initialize simulation engine (after UI is created)
+            InitializeSimulation();
+            
+            // Connect simulation form to engine if it exists
+            if (_simulationForm != null && _simulationEngine != null)
+            {
+                _simulationForm.SetSimulationEngine(_simulationEngine);
+            }
 
             this.FormClosing += MainForm_FormClosing;
 
@@ -248,23 +269,43 @@ public partial class MainForm : Form
 
         grpControls.Controls.AddRange(new Control[] { btnStartStrategy, btnStopStrategy, lblStrategyStatus });
 
+        // Paper Trading Settings (initially hidden unless paper mode) - positioned to the right of Emergency group
+        grpPaperSettings = new GroupBox
+        {
+            Text = "Paper Settings",
+            Location = new Point(980, 110),
+            Size = new Size(400, 50),
+            Visible = _state.PaperTradingEnabled
+        };
+
+        var lblSlippage = new Label { Text = "Slippage (bps):", Location = new Point(10, 20), AutoSize = true };
+        numPaperSlippage = new NumericUpDown { Location = new Point(95, 17), Width = 50, Minimum = 0, Maximum = 100, DecimalPlaces = 1, Value = (decimal)_state.PaperSlippageBps };
+
+        var lblDelay = new Label { Text = "Delay (ms):", Location = new Point(155, 20), AutoSize = true };
+        numPaperDelay = new NumericUpDown { Location = new Point(225, 17), Width = 60, Minimum = 0, Maximum = 5000, Value = _state.PaperFillDelayMs };
+
+        btnResetPaper = new Button { Text = "Reset", Location = new Point(290, 14), Size = new Size(60, 28) };
+        btnResetPaper.Click += BtnResetPaper_Click;
+
+        grpPaperSettings.Controls.AddRange(new Control[] { lblSlippage, numPaperSlippage, lblDelay, numPaperDelay, btnResetPaper });
+
         // Risk Management Group
         var grpRisk = new GroupBox
         {
             Text = "Risk Management",
-            Location = new Point(0, 105),
-            Size = new Size(620, 50)
+            Location = new Point(0, 110),
+            Size = new Size(610, 50)
         };
 
         var lblMaxLoss = new Label { Text = "Max Daily Loss $:", Location = new Point(10, 20), AutoSize = true };
-        numMaxDailyLoss = new NumericUpDown { Location = new Point(160, 17), Width = 70, Minimum = 100, Maximum = 10000, Value = (decimal)_state.RiskSettings.MaxDailyLossUsd, DecimalPlaces = 0 };
+        numMaxDailyLoss = new NumericUpDown { Location = new Point(140, 17), Width = 70, Minimum = 100, Maximum = 10000, Value = (decimal)_state.RiskSettings.MaxDailyLossUsd, DecimalPlaces = 0 };
 
-        var lblMaxPos = new Label { Text = "Max Contracts:", Location = new Point(215, 20), AutoSize = true };
-        numMaxContracts = new NumericUpDown { Location = new Point(350, 17), Width = 50, Minimum = 1, Maximum = 50, Value = _state.RiskSettings.MaxTotalContracts };
+        var lblMaxPos = new Label { Text = "Max Contracts:", Location = new Point(220, 20), AutoSize = true };
+        numMaxContracts = new NumericUpDown { Location = new Point(320, 17), Width = 50, Minimum = 1, Maximum = 50, Value = _state.RiskSettings.MaxTotalContracts };
 
-        chkAutoFlatten = new CheckBox { Text = "Auto-Flatten", Location = new Point(440, 18), AutoSize = true, Checked = _state.RiskSettings.AutoFlattenOnLimit };
+        chkAutoFlatten = new CheckBox { Text = "Auto-Flatten", Location = new Point(380, 18), AutoSize = true, Checked = _state.RiskSettings.AutoFlattenOnLimit };
 
-        lblRiskStatus = new Label { Text = "", Location = new Point(460, 20), AutoSize = true, ForeColor = Color.Gray };
+        lblRiskStatus = new Label { Text = "", Location = new Point(480, 20), AutoSize = true, ForeColor = Color.Gray };
 
         grpRisk.Controls.AddRange(new Control[] { lblMaxLoss, numMaxDailyLoss, lblMaxPos, numMaxContracts, chkAutoFlatten, lblRiskStatus });
 
@@ -272,18 +313,18 @@ public partial class MainForm : Form
         var grpEmergency = new GroupBox
         {
             Text = "Daily PnL / Emergency",
-            Location = new Point(630, 105),
+            Location = new Point(620, 110),
             Size = new Size(350, 50)
         };
 
         lblDailyPnL = new Label { Text = "Daily PnL: $0.00", Location = new Point(10, 20), AutoSize = true };
-        prgDailyLoss = new ProgressBar { Location = new Point(130, 17), Size = new Size(100, 20), Maximum = 100, Value = 0 };
+        prgDailyLoss = new ProgressBar { Location = new Point(120, 17), Size = new Size(90, 20), Maximum = 100, Value = 0 };
 
         btnEmergencyFlatten = new Button
         {
             Text = "EMERGENCY FLATTEN",
-            Location = new Point(240, 14),
-            Size = new Size(100, 28),
+            Location = new Point(220, 14),
+            Size = new Size(120, 28),
             BackColor = Color.Red,
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
@@ -297,8 +338,8 @@ public partial class MainForm : Form
         var grpMTF = new GroupBox
         {
             Text = "MTF Strategies (SuperTrend Alignment - All 3 TFs must agree)",
-            Location = new Point(0, 160),
-            Size = new Size(980, 90)
+            Location = new Point(0, 165),
+            Size = new Size(970, 90)
         };
 
         chkMTF_5m15m1H = new CheckBox { Text = "5m/15m/1H", Location = new Point(10, 22), AutoSize = true, Checked = _state.MTF_5m15m1H_Enabled };
@@ -309,7 +350,7 @@ public partial class MainForm : Form
         var lblMTFSizeLabel = new Label { Text = "Contracts:", Location = new Point(540, 25), AutoSize = true };
         numMTFSize = new NumericUpDown { Location = new Point(610, 22), Width = 50, Minimum = 1, Maximum = 50, Value = _state.MTFSize };
 
-        chkMTFAllowShorts = new CheckBox { Text = "Allow Shorts", Location = new Point(680, 22), AutoSize = true, Checked = _state.MTFAllowShorts };
+        chkMTFAllowShorts = new CheckBox { Text = "Allow Shorts", Location = new Point(670, 22), AutoSize = true, Checked = _state.MTFAllowShorts };
 
         lblMTFStatus = new Label { Text = "MTF: Waiting...", Location = new Point(10, 55), AutoSize = true, ForeColor = Color.Gray };
         lblTF1Status = new Label { Text = "TF1: --", Location = new Point(130, 55), AutoSize = true, ForeColor = Color.Gray };
@@ -319,7 +360,7 @@ public partial class MainForm : Form
         var lblMTFInfo = new Label
         {
             Text = "Entry: Divergence + 4 Confirmations when all TFs aligned  |  Long when all bullish, Short when all bearish",
-            Location = new Point(440, 55),
+            Location = new Point(430, 55),
             AutoSize = true,
             ForeColor = Color.DarkBlue
         };
@@ -330,7 +371,7 @@ public partial class MainForm : Form
         var grpContract = new GroupBox
         {
             Text = "GC Contract",
-            Location = new Point(990, 160),
+            Location = new Point(980, 165),
             Size = new Size(200, 90)
         };
 
@@ -347,7 +388,7 @@ public partial class MainForm : Form
         var grpPaperMode = new GroupBox
         {
             Text = "Trading Mode",
-            Location = new Point(1200, 160),
+            Location = new Point(1190, 165),
             Size = new Size(180, 90)
         };
 
@@ -358,26 +399,6 @@ public partial class MainForm : Form
         lblPaperPnL = new Label { Text = "Paper PnL: --", Location = new Point(10, 65), AutoSize = true, ForeColor = Color.Blue };
 
         grpPaperMode.Controls.AddRange(new Control[] { rbLiveTrading, rbPaperTrading, lblPaperPnL });
-
-        // Paper Trading Settings (initially hidden unless paper mode)
-        grpPaperSettings = new GroupBox
-        {
-            Text = "Paper Settings",
-            Location = new Point(990, 0),
-            Size = new Size(390, 50),
-            Visible = _state.PaperTradingEnabled
-        };
-
-        var lblSlippage = new Label { Text = "Slippage (bps):", Location = new Point(10, 20), AutoSize = true };
-        numPaperSlippage = new NumericUpDown { Location = new Point(95, 17), Width = 50, Minimum = 0, Maximum = 100, DecimalPlaces = 1, Value = (decimal)_state.PaperSlippageBps };
-
-        var lblDelay = new Label { Text = "Delay (ms):", Location = new Point(155, 20), AutoSize = true };
-        numPaperDelay = new NumericUpDown { Location = new Point(225, 17), Width = 60, Minimum = 0, Maximum = 5000, Value = _state.PaperFillDelayMs };
-
-        btnResetPaper = new Button { Text = "Reset", Location = new Point(300, 14), Size = new Size(70, 28) };
-        btnResetPaper.Click += BtnResetPaper_Click;
-
-        grpPaperSettings.Controls.AddRange(new Control[] { lblSlippage, numPaperSlippage, lblDelay, numPaperDelay, btnResetPaper });
 
         panel.Controls.AddRange(new Control[] { grpConnection, grpStatus, grpStrategy, grpControls, grpRisk, grpEmergency, grpMTF, grpContract, grpPaperMode, grpPaperSettings });
 
@@ -409,12 +430,21 @@ public partial class MainForm : Form
         var tabPerformance = new TabPage("Performance Dashboard");
         tabPerformance.Controls.Add(CreatePerformancePanel());
 
+        // Entry Conditions Tab
+        var tabEntryConditions = new TabPage("Entry Conditions");
+        tabEntryConditions.Controls.Add(CreateEntryConditionsPanel());
+
+        // Simulation Tab
+        var tabSimulation = new TabPage("Simulation");
+        _simulationForm = new SimulationForm();
+        tabSimulation.Controls.Add(_simulationForm);
+
         // Log Tab
         var tabLog = new TabPage("Activity Log");
         txtLog = new RichTextBox { Dock = DockStyle.Fill, ReadOnly = true, Font = new Font("Consolas", 9) };
         tabLog.Controls.Add(txtLog);
 
-        tabControl.TabPages.AddRange(new[] { tabOrders, tabFills, tabPositions, tabPerformance, tabLog });
+        tabControl.TabPages.AddRange(new[] { tabOrders, tabFills, tabPositions, tabPerformance, tabEntryConditions, tabSimulation, tabLog });
 
         panel.Controls.Add(tabControl);
         return panel;
@@ -521,6 +551,146 @@ public partial class MainForm : Form
 
         panel.Controls.AddRange(new Control[] { grpToday, grpMetrics, grpWinLoss, grpRecentTrades });
 
+        return panel;
+    }
+
+    private Panel CreateEntryConditionsPanel()
+    {
+        var panel = new Panel { Dock = DockStyle.Fill };
+
+        // Create split container for multiple strategies
+        var splitContainer = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal
+        };
+
+        // Top panel - Aggressive and Conservative
+        var topPanel = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Vertical
+        };
+
+        // Aggressive Strategy Panel
+        var grpAggressive = new GroupBox
+        {
+            Text = "Aggressive Strategy - Entry Conditions",
+            Dock = DockStyle.Fill
+        };
+
+        lblAggressiveCanEnter = new Label
+        {
+            Text = "Status: Not Running",
+            Location = new Point(10, 25),
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10, FontStyle.Bold),
+            ForeColor = Color.Gray
+        };
+
+        dgvAggressiveConditions = new DataGridView
+        {
+            Location = new Point(10, 55),
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            ReadOnly = true,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            RowHeadersVisible = false
+        };
+        dgvAggressiveConditions.Columns.Add("Condition", "Condition");
+        dgvAggressiveConditions.Columns.Add("Status", "Status");
+        dgvAggressiveConditions.Columns.Add("Description", "Description");
+        dgvAggressiveConditions.Columns.Add("Value", "Value");
+        dgvAggressiveConditions.Columns["Status"].Width = 80;
+        dgvAggressiveConditions.Columns["Value"].Width = 120;
+
+        grpAggressive.Controls.Add(lblAggressiveCanEnter);
+        grpAggressive.Controls.Add(dgvAggressiveConditions);
+
+        // Conservative Strategy Panel
+        var grpConservative = new GroupBox
+        {
+            Text = "Conservative Strategy - Entry Conditions",
+            Dock = DockStyle.Fill
+        };
+
+        lblConservativeCanEnter = new Label
+        {
+            Text = "Status: Not Running",
+            Location = new Point(10, 25),
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10, FontStyle.Bold),
+            ForeColor = Color.Gray
+        };
+
+        dgvConservativeConditions = new DataGridView
+        {
+            Location = new Point(10, 55),
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            ReadOnly = true,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            RowHeadersVisible = false
+        };
+        dgvConservativeConditions.Columns.Add("Condition", "Condition");
+        dgvConservativeConditions.Columns.Add("Status", "Status");
+        dgvConservativeConditions.Columns.Add("Description", "Description");
+        dgvConservativeConditions.Columns.Add("Value", "Value");
+        dgvConservativeConditions.Columns["Status"].Width = 80;
+        dgvConservativeConditions.Columns["Value"].Width = 120;
+
+        grpConservative.Controls.Add(lblConservativeCanEnter);
+        grpConservative.Controls.Add(dgvConservativeConditions);
+
+        topPanel.Panel1.Controls.Add(grpAggressive);
+        topPanel.Panel2.Controls.Add(grpConservative);
+
+        // Bottom panel - MTF Strategy
+        var grpMTF = new GroupBox
+        {
+            Text = "MTF Strategy - Entry Conditions",
+            Dock = DockStyle.Fill
+        };
+
+        lblMTFCanEnter = new Label
+        {
+            Text = "Status: Not Running",
+            Location = new Point(10, 25),
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10, FontStyle.Bold),
+            ForeColor = Color.Gray
+        };
+
+        dgvMTFConditions = new DataGridView
+        {
+            Location = new Point(10, 55),
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            ReadOnly = true,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            RowHeadersVisible = false
+        };
+        dgvMTFConditions.Columns.Add("Condition", "Condition");
+        dgvMTFConditions.Columns.Add("Status", "Status");
+        dgvMTFConditions.Columns.Add("Description", "Description");
+        dgvMTFConditions.Columns.Add("Value", "Value");
+        dgvMTFConditions.Columns["Status"].Width = 80;
+        dgvMTFConditions.Columns["Value"].Width = 120;
+
+        grpMTF.Controls.Add(lblMTFCanEnter);
+        grpMTF.Controls.Add(dgvMTFConditions);
+
+        splitContainer.Panel1.Controls.Add(topPanel);
+        splitContainer.Panel2.Controls.Add(grpMTF);
+        splitContainer.SplitterDistance = panel.Height / 2;
+
+        panel.Controls.Add(splitContainer);
         return panel;
     }
 
@@ -1403,7 +1573,13 @@ public partial class MainForm : Form
             );
             _aggressiveEngine.OnLog += msg => Log($"[AGG] {msg}");
             _aggressiveEngine.OnStateChanged += state => OnAggressiveStateChanged(state);
+            _aggressiveEngine.OnEntryConditionsUpdated += OnAggressiveConditionsUpdated;
             _aggressiveEngine.Start();
+            
+            // Register with simulation engine
+            _simulationEngine?.RegisterStrategy(_aggressiveEngine);
+            _simulationForm?.RegisterStrategy("Aggressive");
+            
             Log("Aggressive strategy started" + (savedState != null ? " (restored position)" : ""));
         }
 
@@ -1425,7 +1601,13 @@ public partial class MainForm : Form
             );
             _conservativeEngine.OnLog += msg => Log($"[CONS] {msg}");
             _conservativeEngine.OnStateChanged += state => OnConservativeStateChanged(state);
+            _conservativeEngine.OnEntryConditionsUpdated += OnConservativeConditionsUpdated;
             _conservativeEngine.Start();
+            
+            // Register with simulation engine
+            _simulationEngine?.RegisterStrategy(_conservativeEngine);
+            _simulationForm?.RegisterStrategy("Conservative");
+            
             Log("Conservative strategy started" + (savedState != null ? " (restored position)" : ""));
         }
 
@@ -1509,20 +1691,149 @@ public partial class MainForm : Form
         _mtfEngine.OnLog += msg => Log(msg);
         _mtfEngine.OnStateChanged += OnMTFStateChanged;
         _mtfEngine.OnAlignmentUpdated += OnMTFAlignmentUpdated;
+        _mtfEngine.OnEntryConditionsUpdated += OnMTFConditionsUpdated;
         _mtfEngine.Start();
+
+        // Register with simulation engine
+        _simulationEngine?.RegisterStrategy(_mtfEngine);
+        _simulationForm?.RegisterStrategy(presetName);
 
         Log($"MTF strategy started: {presetName}" + (savedState != null ? " (restored position)" : ""));
     }
 
-    private void OnMTFStateChanged(MTFStrategyState state)
+    private void OnMTFStateChanged(StrategyState state)
     {
+        if (state is not MTFStrategyState mtfState)
+        {
+            return;
+        }
+
         lock (_stateLock)
         {
-            _state.MTFState = state;
+            _state.MTFState = mtfState;
         }
         SaveState();
-        var direction = state.PositionDirection == 1 ? "LONG" : state.PositionDirection == -1 ? "SHORT" : "FLAT";
-        Log($"[MTF] State saved - {direction}, Entry: {state.EntryPrice:F2}");
+        var direction = mtfState.PositionDirection == 1 ? "LONG" : mtfState.PositionDirection == -1 ? "SHORT" : "FLAT";
+        Log($"[MTF] State saved - {direction}, Entry: {mtfState.EntryPrice:F2}");
+    }
+
+    private void OnAggressiveConditionsUpdated(EntryConditionsResult result)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(() => OnAggressiveConditionsUpdated(result));
+            return;
+        }
+
+        UpdateConditionsGrid(dgvAggressiveConditions, result);
+        UpdateCanEnterLabel(lblAggressiveCanEnter, result);
+    }
+
+    private void OnConservativeConditionsUpdated(EntryConditionsResult result)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(() => OnConservativeConditionsUpdated(result));
+            return;
+        }
+
+        UpdateConditionsGrid(dgvConservativeConditions, result);
+        UpdateCanEnterLabel(lblConservativeCanEnter, result);
+    }
+
+    private void OnMTFConditionsUpdated(EntryConditionsResult result)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(() => OnMTFConditionsUpdated(result));
+            return;
+        }
+
+        UpdateConditionsGrid(dgvMTFConditions, result);
+        UpdateCanEnterLabel(lblMTFCanEnter, result);
+    }
+
+    private void UpdateConditionsGrid(DataGridView dgv, EntryConditionsResult result)
+    {
+        dgv.Rows.Clear();
+
+        foreach (var condition in result.Conditions)
+        {
+            var row = dgv.Rows.Add(
+                condition.ConditionName,
+                condition.IsTrue ? "✓ TRUE" : "✗ FALSE",
+                condition.Description,
+                condition.Value ?? ""
+            );
+
+            // Color code the status
+            var statusCell = dgv.Rows[row].Cells["Status"];
+            if (condition.IsTrue)
+            {
+                statusCell.Style.ForeColor = Color.Green;
+                statusCell.Style.Font = new Font(dgv.Font, FontStyle.Bold);
+            }
+            else
+            {
+                statusCell.Style.ForeColor = Color.Red;
+            }
+        }
+
+        // Add summary row if there are confirmations
+        if (result.RequiredConfirmations > 0)
+        {
+            var summaryRow = dgv.Rows.Add(
+                "Confirmations",
+                $"{result.ConfirmationsCount}/{result.RequiredConfirmations}",
+                result.ConfirmationsCount >= result.RequiredConfirmations
+                    ? "Required confirmations met"
+                    : $"Need {result.RequiredConfirmations - result.ConfirmationsCount} more",
+                ""
+            );
+
+            var summaryStatusCell = dgv.Rows[summaryRow].Cells["Status"];
+            if (result.ConfirmationsCount >= result.RequiredConfirmations)
+            {
+                summaryStatusCell.Style.ForeColor = Color.Green;
+                summaryStatusCell.Style.Font = new Font(dgv.Font, FontStyle.Bold);
+            }
+            else
+            {
+                summaryStatusCell.Style.ForeColor = Color.Orange;
+            }
+        }
+    }
+
+    private void UpdateCanEnterLabel(Label lbl, EntryConditionsResult result)
+    {
+        if (result.CanEnter)
+        {
+            lbl.Text = "✓ READY TO ENTER";
+            lbl.ForeColor = Color.Green;
+        }
+        else if (result.BlockingReason != null)
+        {
+            lbl.Text = $"✗ BLOCKED: {result.BlockingReason}";
+            lbl.ForeColor = Color.Red;
+        }
+        else
+        {
+            lbl.Text = "⏳ Waiting for conditions...";
+            lbl.ForeColor = Color.Orange;
+        }
+    }
+
+    private void ClearConditionsDisplay(string strategyName, DataGridView dgv, Label lbl)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(() => ClearConditionsDisplay(strategyName, dgv, lbl));
+            return;
+        }
+
+        dgv.Rows.Clear();
+        lbl.Text = $"Status: {strategyName} Strategy Not Running";
+        lbl.ForeColor = Color.Gray;
     }
 
     private void OnMTFAlignmentUpdated(MTFAlignmentResult alignment)
@@ -1605,6 +1916,20 @@ public partial class MainForm : Form
         _aggressiveEngine?.Stop();
         _conservativeEngine?.Stop();
         _mtfEngine?.Stop();
+        
+        // Unregister from simulation engine
+        _simulationEngine?.UnregisterStrategy("Aggressive");
+        _simulationEngine?.UnregisterStrategy("Conservative");
+        if (_mtfEngine != null)
+        {
+            _simulationEngine?.UnregisterStrategy(_mtfEngine.Name);
+        }
+        
+        // Clear condition displays
+        ClearConditionsDisplay("Aggressive", dgvAggressiveConditions, lblAggressiveCanEnter);
+        ClearConditionsDisplay("Conservative", dgvConservativeConditions, lblConservativeCanEnter);
+        ClearConditionsDisplay("MTF", dgvMTFConditions, lblMTFCanEnter);
+        
         _aggressiveEngine = null;
         _conservativeEngine = null;
         _mtfEngine = null;
@@ -1883,5 +2208,25 @@ public partial class MainForm : Form
         _connectionManager?.Dispose();
 
         SaveState();
+    }
+
+    private void InitializeSimulation()
+    {
+        try
+        {
+            _simulationEngine = new SimulationEngine();
+            _simulationEngine.OnLog += msg => Log($"[SIM] {msg}");
+            
+            if (_simulationForm != null)
+            {
+                _simulationForm.SetSimulationEngine(_simulationEngine);
+            }
+            
+            Logger.Info("Simulation engine initialized");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Failed to initialize simulation engine", ex);
+        }
     }
 }

@@ -36,7 +36,7 @@ public class MTFStrategyState : StrategyState
 /// <summary>
 /// MTF Strategy Engine - Uses multi-timeframe SuperTrend alignment with divergence entry
 /// </summary>
-public class MTFStrategyEngine
+public class MTFStrategyEngine : IStrategyEngine
 {
     private readonly IBKRClient _dataClient;      // For market data (always real IBKR)
     private readonly IOrderClient _orderClient;   // For orders (real or paper)
@@ -95,10 +95,15 @@ public class MTFStrategyEngine
     // Bar count for time-based exit
     private int _barCount;
 
+    // IStrategyEngine implementation
+    public string Name => _config.Name;
+
     // Events
     public event Action<string>? OnLog;
-    public event Action<MTFStrategyState>? OnStateChanged;
+    public event Action<StrategyState>? OnStateChanged;  // IStrategyEngine interface
+    public event Action<MTFStrategyState>? OnMTFStateChanged;  // MTF-specific event
     public event Action<MTFAlignmentResult>? OnAlignmentUpdated;
+    public event Action<EntryConditionsResult>? OnEntryConditionsUpdated;
 
     public MTFStrategyEngine(IBKRClient dataClient, IOrderClient orderClient, MTFStrategyConfig config, MTFStrategyState? savedState = null)
     {
@@ -133,7 +138,15 @@ public class MTFStrategyEngine
     }
 
     /// <summary>
-    /// Gets the current strategy state for persistence
+    /// Gets the current strategy state for persistence (IStrategyEngine implementation)
+    /// </summary>
+    StrategyState IStrategyEngine.GetState()
+    {
+        return GetState();
+    }
+
+    /// <summary>
+    /// Gets the current MTF strategy state for persistence
     /// </summary>
     public MTFStrategyState GetState()
     {
@@ -154,7 +167,10 @@ public class MTFStrategyEngine
 
     private void NotifyStateChanged()
     {
-        OnStateChanged?.Invoke(GetState());
+        var state = GetState();
+        // Fire both base interface event (as StrategyState) and MTF-specific event
+        OnStateChanged?.Invoke(state);
+        OnMTFStateChanged?.Invoke(state);
     }
 
     public void Start()
@@ -178,59 +194,65 @@ public class MTFStrategyEngine
     private void OnBar(BarData bar)
     {
         if (!_isRunning) return;
+        ProcessBar(bar);  // ProcessBar now handles exceptions and re-throws for circuit breaker
+    }
 
+    public void ProcessBar(BarData bar)
+    {
         try
         {
-            ProcessBar(bar);
+            _barCount++;
+
+            // Store bar for divergence calculations
+            lock (_barsLock)
+            {
+                _bars.Add(bar);
+                while (_bars.Count > _lookback)
+                    _bars.RemoveAt(0);
+            }
+
+            // Forward to MTF manager for aggregation
+            _mtfManager.ProcessBar(bar);
+
+            // Calculate indicators from 5-second bars (for entry timing)
+            CalculateIndicators();
+
+            // Check if MTF manager is warmed up
+            if (!_mtfManager.IsWarmedUp())
+            {
+                return;  // Wait for enough bars
+            }
+
+            // Get MTF alignment
+            var alignment = _mtfManager.GetAlignment();
+
+            // Process entry or position management
+            if (!_inPosition && !_pendingEntry && !_pendingExit)
+            {
+                if (alignment.AllBullish)
+                {
+                    CheckLongEntry(bar, alignment);
+                }
+                else if (alignment.AllBearish && _config.AllowShorts)
+                {
+                    CheckShortEntry(bar, alignment);
+                }
+            }
+            else if (_inPosition && !_pendingExit)
+            {
+                ManagePosition(bar);
+            }
+
+            // Update entry condition status for UI
+            var conditionsResult = EvaluateEntryConditions(bar, alignment);
+            OnEntryConditionsUpdated?.Invoke(conditionsResult);
         }
         catch (Exception ex)
         {
-            Log($"Error processing bar: {ex.Message}");
-        }
-    }
-
-    private void ProcessBar(BarData bar)
-    {
-        _barCount++;
-
-        // Store bar for divergence calculations
-        lock (_barsLock)
-        {
-            _bars.Add(bar);
-            while (_bars.Count > _lookback)
-                _bars.RemoveAt(0);
-        }
-
-        // Forward to MTF manager for aggregation
-        _mtfManager.ProcessBar(bar);
-
-        // Calculate indicators from 5-second bars (for entry timing)
-        CalculateIndicators();
-
-        // Check if MTF manager is warmed up
-        if (!_mtfManager.IsWarmedUp())
-        {
-            return;  // Wait for enough bars
-        }
-
-        // Get MTF alignment
-        var alignment = _mtfManager.GetAlignment();
-
-        // Process entry or position management
-        if (!_inPosition && !_pendingEntry && !_pendingExit)
-        {
-            if (alignment.AllBullish)
-            {
-                CheckLongEntry(bar, alignment);
-            }
-            else if (alignment.AllBearish && _config.AllowShorts)
-            {
-                CheckShortEntry(bar, alignment);
-            }
-        }
-        else if (_inPosition && !_pendingExit)
-        {
-            ManagePosition(bar);
+            Log($"ERROR in ProcessBar: {ex.Message}");
+            Logger.Error($"Error processing bar in {_config.Name}", ex);
+            // Re-throw to let circuit breaker handle it
+            throw;
         }
     }
 
@@ -600,6 +622,546 @@ public class MTFStrategyEngine
     public string[] GetTimeframeNames()
     {
         return _mtfManager.GetTimeframeNames();
+    }
+
+    /// <summary>
+    /// Evaluates all entry conditions and returns their status
+    /// </summary>
+    public EntryConditionsResult EvaluateEntryConditions(BarData? bar = null, MTFAlignmentResult? alignment = null)
+    {
+        var result = new EntryConditionsResult
+        {
+            StrategyName = _config.Name,
+            RequiredConfirmations = _minConfirmations,
+            CanEnter = false
+        };
+
+        // If not running, return empty result
+        if (!_isRunning)
+        {
+            result.Conditions.Add(new EntryConditionStatus
+            {
+                ConditionName = "Strategy Running",
+                IsTrue = false,
+                Description = "Strategy must be running"
+            });
+            return result;
+        }
+
+        // Check if already in position
+        if (_inPosition)
+        {
+            result.Conditions.Add(new EntryConditionStatus
+            {
+                ConditionName = "Not In Position",
+                IsTrue = false,
+                Description = "Already in position"
+            });
+            result.BlockingReason = "Already in position";
+            return result;
+        }
+
+        // Check if pending entry/exit
+        if (_pendingEntry || _pendingExit)
+        {
+            result.Conditions.Add(new EntryConditionStatus
+            {
+                ConditionName = "No Pending Orders",
+                IsTrue = false,
+                Description = _pendingEntry ? "Entry order pending" : "Exit order pending"
+            });
+            result.BlockingReason = _pendingEntry ? "Entry order pending" : "Exit order pending";
+            return result;
+        }
+
+        // Need enough bars
+        int barCount;
+        lock (_barsLock)
+        {
+            barCount = _bars.Count;
+        }
+
+        if (barCount < 50)
+        {
+            result.Conditions.Add(new EntryConditionStatus
+            {
+                ConditionName = "Enough Bars",
+                IsTrue = false,
+                Description = $"Need 50 bars, have {barCount}",
+                Value = $"{barCount}/50"
+            });
+            result.BlockingReason = "Not enough bars";
+            return result;
+        }
+        result.Conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Enough Bars",
+            IsTrue = true,
+            Description = $"Have {barCount} bars",
+            Value = $"{barCount}/50"
+        });
+
+        // Check MTF manager warmup
+        if (!_mtfManager.IsWarmedUp())
+        {
+            result.Conditions.Add(new EntryConditionStatus
+            {
+                ConditionName = "MTF Warmed Up",
+                IsTrue = false,
+                Description = "MTF manager not warmed up"
+            });
+            result.BlockingReason = "MTF manager not warmed up";
+            return result;
+        }
+        result.Conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "MTF Warmed Up",
+            IsTrue = true,
+            Description = "MTF manager ready"
+        });
+
+        // Get alignment if not provided
+        if (alignment == null)
+        {
+            alignment = _mtfManager.GetAlignment();
+        }
+
+        // Check MTF alignment
+        bool isLongCandidate = alignment.AllBullish;
+        bool isShortCandidate = alignment.AllBearish && _config.AllowShorts;
+        bool alignmentOk = isLongCandidate || isShortCandidate;
+
+        string alignmentDesc = alignmentOk
+            ? (isLongCandidate ? "All timeframes bullish" : "All timeframes bearish")
+            : "Timeframes not aligned";
+
+        result.Conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "MTF Alignment",
+            IsTrue = alignmentOk,
+            Description = alignmentDesc,
+            Value = alignment.AlignmentDescription
+        });
+
+        if (!alignmentOk)
+        {
+            result.BlockingReason = "Timeframes not aligned";
+            return result;
+        }
+
+        // Use latest bar if not provided
+        if (bar == null)
+        {
+            lock (_barsLock)
+            {
+                bar = _bars.Count > 0 ? _bars.Last() : null;
+            }
+        }
+
+        if (bar == null)
+        {
+            result.BlockingReason = "No bar data";
+            return result;
+        }
+
+        // Check divergence (direction-specific)
+        bool hasDivergence;
+        string divergenceName;
+        if (isLongCandidate)
+        {
+            hasDivergence = DetectBullishDivergence();
+            divergenceName = "Bullish Divergence";
+        }
+        else
+        {
+            hasDivergence = DetectBearishDivergence();
+            divergenceName = "Bearish Divergence";
+        }
+
+        result.Conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = divergenceName,
+            IsTrue = hasDivergence,
+            Description = hasDivergence ? $"{divergenceName} detected" : $"No {divergenceName.ToLower()}"
+        });
+
+        if (!hasDivergence)
+        {
+            result.BlockingReason = $"No {divergenceName.ToLower()}";
+            return result;
+        }
+
+        // Evaluate confirmations (direction-specific)
+        List<EntryConditionStatus> confirmations;
+        if (isLongCandidate)
+        {
+            confirmations = EvaluateBullishConfirmations(bar);
+        }
+        else
+        {
+            confirmations = EvaluateBearishConfirmations(bar);
+        }
+
+        result.ConfirmationsCount = confirmations.Count(c => c.IsTrue);
+        result.Conditions.AddRange(confirmations);
+
+        if (result.ConfirmationsCount < _minConfirmations)
+        {
+            result.BlockingReason = $"Only {result.ConfirmationsCount}/{_minConfirmations} confirmations";
+            return result;
+        }
+
+        // Check position size
+        var quantity = CalculatePositionSize();
+        bool sizeOk = quantity > 0;
+        result.Conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Position Size",
+            IsTrue = sizeOk,
+            Description = sizeOk ? $"Position size: {quantity}" : "Position size is 0",
+            Value = quantity.ToString()
+        });
+
+        if (!sizeOk)
+        {
+            result.BlockingReason = "Position size is 0";
+            return result;
+        }
+
+        // All conditions met
+        result.CanEnter = true;
+        return result;
+    }
+
+    /// <summary>
+    /// Evaluates individual bullish confirmation conditions
+    /// </summary>
+    private List<EntryConditionStatus> EvaluateBullishConfirmations(BarData bar)
+    {
+        var conditions = new List<EntryConditionStatus>();
+
+        // Bull regime (price > SMA50)
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Bull Regime",
+            IsTrue = _bullRegime,
+            Description = _bullRegime ? "Price > SMA50" : "Price < SMA50",
+            Value = $"SMA50: {_sma50:F2}"
+        });
+
+        // EMA bullish (13 > 34)
+        bool emaBullish = _ema13 > _ema34;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "EMA Alignment",
+            IsTrue = emaBullish,
+            Description = emaBullish ? "EMA13 > EMA34" : "EMA13 < EMA34",
+            Value = $"EMA13: {_ema13:F2}, EMA34: {_ema34:F2}"
+        });
+
+        // SuperTrend bullish
+        bool superTrendBullish = bar.Close > _superTrend;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "SuperTrend",
+            IsTrue = superTrendBullish,
+            Description = superTrendBullish ? "Price > SuperTrend" : "Price < SuperTrend",
+            Value = $"ST: {_superTrend:F2}"
+        });
+
+        // RSI in valid range (30-70)
+        bool rsiOk = _rsi >= 30 && _rsi <= 70;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "RSI Range",
+            IsTrue = rsiOk,
+            Description = rsiOk ? "RSI in range (30-70)" : $"RSI out of range: {_rsi:F1}",
+            Value = $"{_rsi:F1}"
+        });
+
+        // MACD improving
+        bool macdImproving = _macdHist > _prevMacdHist;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "MACD Improving",
+            IsTrue = macdImproving,
+            Description = macdImproving ? "MACD histogram increasing" : "MACD histogram declining",
+            Value = $"Hist: {_macdHist:F4}"
+        });
+
+        // Volatility OK
+        bool volatilityOk = _atr > 0;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Volatility",
+            IsTrue = volatilityOk,
+            Description = volatilityOk ? "ATR sufficient" : "ATR too low",
+            Value = $"ATR: {_atr:F2}"
+        });
+
+        return conditions;
+    }
+
+    /// <summary>
+    /// Evaluates individual bearish confirmation conditions
+    /// </summary>
+    private List<EntryConditionStatus> EvaluateBearishConfirmations(BarData bar)
+    {
+        var conditions = new List<EntryConditionStatus>();
+
+        // Bear regime (price < SMA50)
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Bear Regime",
+            IsTrue = !_bullRegime,
+            Description = !_bullRegime ? "Price < SMA50" : "Price > SMA50",
+            Value = $"SMA50: {_sma50:F2}"
+        });
+
+        // EMA bearish (13 < 34)
+        bool emaBearish = _ema13 < _ema34;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "EMA Alignment",
+            IsTrue = emaBearish,
+            Description = emaBearish ? "EMA13 < EMA34" : "EMA13 > EMA34",
+            Value = $"EMA13: {_ema13:F2}, EMA34: {_ema34:F2}"
+        });
+
+        // SuperTrend bearish
+        bool superTrendBearish = bar.Close < _superTrend;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "SuperTrend",
+            IsTrue = superTrendBearish,
+            Description = superTrendBearish ? "Price < SuperTrend" : "Price > SuperTrend",
+            Value = $"ST: {_superTrend:F2}"
+        });
+
+        // RSI in valid range (30-70)
+        bool rsiOk = _rsi >= 30 && _rsi <= 70;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "RSI Range",
+            IsTrue = rsiOk,
+            Description = rsiOk ? "RSI in range (30-70)" : $"RSI out of range: {_rsi:F1}",
+            Value = $"{_rsi:F1}"
+        });
+
+        // MACD declining
+        bool macdDeclining = _macdHist < _prevMacdHist;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "MACD Declining",
+            IsTrue = macdDeclining,
+            Description = macdDeclining ? "MACD histogram declining" : "MACD histogram increasing",
+            Value = $"Hist: {_macdHist:F4}"
+        });
+
+        // Volatility OK
+        bool volatilityOk = _atr > 0;
+        conditions.Add(new EntryConditionStatus
+        {
+            ConditionName = "Volatility",
+            IsTrue = volatilityOk,
+            Description = volatilityOk ? "ATR sufficient" : "ATR too low",
+            Value = $"ATR: {_atr:F2}"
+        });
+
+        return conditions;
+    }
+
+    /// <summary>
+    /// Evaluates all exit conditions and returns their status
+    /// </summary>
+    public ExitConditionsResult? EvaluateExitConditions(BarData? bar = null)
+    {
+        var result = new ExitConditionsResult
+        {
+            StrategyName = _config.Name,
+            InPosition = _inPosition,
+            ShouldExit = false,
+            EntryPrice = _entryPrice,
+            StopPrice = _stopPrice,
+            TargetPrice = _targetPrice,
+            BarsHeld = _entryBarCount
+        };
+
+        // If not in position, return result indicating no position
+        if (!_inPosition)
+        {
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "In Position",
+                IsTrue = false,
+                Description = "Not in position - no exit conditions to evaluate"
+            });
+            return result;
+        }
+
+        // Use latest bar if not provided
+        if (bar == null)
+        {
+            lock (_barsLock)
+            {
+                bar = _bars.Count > 0 ? _bars.Last() : null;
+            }
+        }
+
+        if (bar == null)
+        {
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "Bar Data",
+                IsTrue = false,
+                Description = "No bar data available"
+            });
+            return result;
+        }
+
+        var price = bar.Close;
+        double pnl;
+        double pnlPct;
+        double currentStop = _stopPrice;
+        bool isLong = _positionDirection == 1;
+
+        if (isLong)
+        {
+            pnlPct = (price - _entryPrice) / _entryPrice * 100;
+            pnl = (price - _entryPrice) * (double)_positionQuantity * 100; // 100 oz multiplier
+
+            // Check trailing stop for longs
+            if (pnlPct > _trailStartPct)
+            {
+                var newStop = price - (_trailAtrMult * _atr);
+                if (newStop > _stopPrice)
+                {
+                    currentStop = newStop;
+                }
+            }
+
+            // Check stop loss (price goes down)
+            bool stopHit = bar.Low <= currentStop;
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "Stop Loss",
+                IsTrue = stopHit,
+                Description = stopHit ? $"Stop loss hit at {bar.Low:F2}" : $"Stop loss not hit (Stop: {currentStop:F2})",
+                Value = $"Stop: {currentStop:F2}, Low: {bar.Low:F2}"
+            });
+
+            if (stopHit)
+            {
+                result.ShouldExit = true;
+                result.ExitReason = "Stop Loss";
+            }
+
+            // Check target (price goes up)
+            bool targetHit = bar.High >= _targetPrice;
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "Take Profit",
+                IsTrue = targetHit,
+                Description = targetHit ? $"Target hit at {bar.High:F2}" : $"Target not hit (Target: {_targetPrice:F2})",
+                Value = $"Target: {_targetPrice:F2}, High: {bar.High:F2}"
+            });
+
+            if (targetHit)
+            {
+                result.ShouldExit = true;
+                result.ExitReason = "Take Profit";
+            }
+        }
+        else // Short position
+        {
+            pnlPct = (_entryPrice - price) / _entryPrice * 100;
+            pnl = (_entryPrice - price) * (double)_positionQuantity * 100; // 100 oz multiplier
+
+            // Check trailing stop for shorts
+            if (pnlPct > _trailStartPct)
+            {
+                var newStop = price + (_trailAtrMult * _atr);
+                if (newStop < _stopPrice)
+                {
+                    currentStop = newStop;
+                }
+            }
+
+            // Check stop loss (price goes up for shorts)
+            bool stopHit = bar.High >= currentStop;
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "Stop Loss",
+                IsTrue = stopHit,
+                Description = stopHit ? $"Stop loss hit at {bar.High:F2}" : $"Stop loss not hit (Stop: {currentStop:F2})",
+                Value = $"Stop: {currentStop:F2}, High: {bar.High:F2}"
+            });
+
+            if (stopHit)
+            {
+                result.ShouldExit = true;
+                result.ExitReason = "Stop Loss";
+            }
+
+            // Check target (price goes down for shorts)
+            bool targetHit = bar.Low <= _targetPrice;
+            result.Conditions.Add(new ExitConditionStatus
+            {
+                ConditionName = "Take Profit",
+                IsTrue = targetHit,
+                Description = targetHit ? $"Target hit at {bar.Low:F2}" : $"Target not hit (Target: {_targetPrice:F2})",
+                Value = $"Target: {_targetPrice:F2}, Low: {bar.Low:F2}"
+            });
+
+            if (targetHit)
+            {
+                result.ShouldExit = true;
+                result.ExitReason = "Take Profit";
+            }
+        }
+
+        result.CurrentPrice = price;
+        result.UnrealizedPnL = pnl;
+        result.UnrealizedPnLPct = pnlPct;
+        result.StopPrice = currentStop; // Update with trailing stop if applicable
+
+        // Check trailing stop
+        bool trailingStopActive = pnlPct > _trailStartPct;
+        result.Conditions.Add(new ExitConditionStatus
+        {
+            ConditionName = "Trailing Stop",
+            IsTrue = trailingStopActive,
+            Description = trailingStopActive ? "Trailing stop active" : $"Trailing stop not active (need {_trailStartPct}% profit)",
+            Value = $"Current Stop: {currentStop:F2}"
+        });
+
+        // Check time exit
+        bool timeExit = _entryBarCount >= _maxHoldBars;
+        result.Conditions.Add(new ExitConditionStatus
+        {
+            ConditionName = "Time Exit",
+            IsTrue = timeExit,
+            Description = timeExit ? $"Max hold time reached ({_entryBarCount} bars)" : $"Bars held: {_entryBarCount}/{_maxHoldBars}",
+            Value = $"{_entryBarCount}/{_maxHoldBars} bars"
+        });
+
+        if (timeExit)
+        {
+            result.ShouldExit = true;
+            result.ExitReason = "Time Exit";
+        }
+
+        // Add position summary
+        var direction = isLong ? "LONG" : "SHORT";
+        result.Conditions.Add(new ExitConditionStatus
+        {
+            ConditionName = "Position Summary",
+            IsTrue = true,
+            Description = $"{direction} - Entry: {_entryPrice:F2}, Current: {price:F2}, PnL: ${pnl:F2} ({pnlPct:F2}%)",
+            Value = $"Qty: {_positionQuantity}"
+        });
+
+        return result;
     }
 
     private void Log(string message)

@@ -194,3 +194,57 @@ public class BarData
     public decimal WAP { get; set; }
     public int Count { get; set; }
 }
+
+/// <summary>
+/// Entry condition status for UI display
+/// </summary>
+public class EntryConditionStatus
+{
+    public string ConditionName { get; set; } = "";
+    public bool IsTrue { get; set; }
+    public string Description { get; set; } = "";
+    public string? Value { get; set; }  // Optional value to display (e.g., "RSI: 45.2")
+}
+
+/// <summary>
+/// Complete entry condition evaluation result for a strategy
+/// </summary>
+public class EntryConditionsResult
+{
+    public string StrategyName { get; set; } = "";
+    public bool CanEnter { get; set; }
+    public List<EntryConditionStatus> Conditions { get; set; } = new();
+    public int ConfirmationsCount { get; set; }
+    public int RequiredConfirmations { get; set; }
+    public string? BlockingReason { get; set; }  // Why entry is blocked (if CanEnter is false)
+}
+
+/// <summary>
+/// Exit condition status for UI display
+/// </summary>
+public class ExitConditionStatus
+{
+    public string ConditionName { get; set; } = "";
+    public bool IsTrue { get; set; }
+    public string Description { get; set; } = "";
+    public string? Value { get; set; }  // Optional value to display (e.g., "Stop: 2045.00")
+}
+
+/// <summary>
+/// Complete exit condition evaluation result for a strategy
+/// </summary>
+public class ExitConditionsResult
+{
+    public string StrategyName { get; set; } = "";
+    public bool InPosition { get; set; }
+    public bool ShouldExit { get; set; }
+    public List<ExitConditionStatus> Conditions { get; set; } = new();
+    public string? ExitReason { get; set; }  // Why exit should occur (if ShouldExit is true)
+    public double EntryPrice { get; set; }
+    public double CurrentPrice { get; set; }
+    public double StopPrice { get; set; }
+    public double TargetPrice { get; set; }
+    public double UnrealizedPnL { get; set; }
+    public double UnrealizedPnLPct { get; set; }
+    public int BarsHeld { get; set; }
+}
