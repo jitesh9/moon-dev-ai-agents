@@ -511,11 +511,15 @@ RISK MANAGEMENT:
 
 If you need indicators use TA lib or pandas TA.
 
-Use this data path: src/data/rbi/BTC-USD-15m.csv (relative to project root)
-the above data head looks like below
-datetime, open, high, low, close, volume,
-2023-01-01 00:00:00, 16531.83, 16532.69, 16509.11, 16510.82, 231.05338022,
-2023-01-01 00:15:00, 16509.78, 16534.66, 16509.11, 16533.43, 308.12276951,
+DATA LOADING - Use Moon Dev's unified data loader:
+from src.utils.data_loader import load_ohlcv
+data = load_ohlcv('SYMBOL', 'TIMEFRAME')  # e.g., load_ohlcv('ES', '15m') or load_ohlcv('BTC-USD', '15m')
+
+This automatically loads from PostgreSQL if DATABASE_URL is configured, otherwise falls back to CSV files.
+The data is returned with columns: Open, High, Low, Close, Volume (capitalized for backtesting.py)
+
+Available symbols depend on your database/CSV files. Common futures: ES, NQ, GC, CL
+Common crypto: BTC-USD, ETH-USD, SOL-USD
 
 Always add plenty of Moon Dev themed debug prints with emojis to make debugging easier! 🌙 ✨ 🚀
 
@@ -534,13 +538,13 @@ if __name__ == "__main__":
     import os
     from backtesting import Backtest
     import pandas as pd
+    from src.utils.data_loader import load_ohlcv
 
     # FIRST: Run standard backtest and print stats (REQUIRED for parsing!)
     print("\\n🌙 Running initial backtest for stats extraction...")
-    data = pd.read_csv('src/data/rbi/BTC-USD-15m.csv')  # 🌙 Moon Dev: Relative path from project root!
-    data['datetime'] = pd.to_datetime(data['datetime'])
-    data = data.set_index('datetime')
-    data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    # 🌙 Moon Dev: Use unified data loader - works with PostgreSQL or CSV!
+    # Change symbol/timeframe as needed: 'ES', 'NQ', 'GC', 'CL' for futures
+    data = load_ohlcv('ES', '15m')  # or load_ohlcv('BTC-USD', '15m') for crypto
 
     bt = Backtest(data, YourStrategyClassName, cash=1_000_000, commission=0.002)
     stats = bt.run()

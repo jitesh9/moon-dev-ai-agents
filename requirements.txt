@@ -637,3 +637,8 @@ yfinance==0.2.43
 youtube-transcript-api==1.2.3
 yt-dlp==2025.1.26
 zipp==3.19.2
+
+# PostgreSQL support for futures data
+SQLAlchemy==2.0.25
+psycopg2-binary==2.9.9
+zstandard

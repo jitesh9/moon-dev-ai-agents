@@ -1,0 +1,116 @@
+//@version=5
+strategy("ES Intraday Swing 2025 – Final Production Version (SuperTrend + POC + Daily Filter)", 
+     overlay=true, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=100, 
+     initial_capital=50000,
+     commission_type=strategy.commission.percent, 
+     commission_value=0.005,   // IBKR + exchange approx
+     slippage=1,
+     pyramiding=1,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false)
+
+// ──────────────────────────────────────────────
+// ── Inputs
+// ──────────────────────────────────────────────
+superPeriod   = input.int(10,  "SuperTrend ATR Period")
+superMult     = input.float(3.0, "SuperTrend Multiplier", step=0.1)
+dailySMAlen   = input.int(50, "Daily Regime SMA Length")
+atrLen        = input.int(14, "ATR Length")
+stopMult      = input.float(1.5, "Initial Stop × ATR", step=0.1)
+usePOCfilter  = input.bool(true, "Require Trade Toward POC")
+
+// ──────────────────────────────────────────────
+// ── 1. Daily 50 SMA Regime Filter
+// ──────────────────────────────────────────────
+dailySMA = request.security(syminfo.tickerid, "D", ta.sma(close, dailySMAlen))
+bullRegime  = close > dailySMA
+bearRegime  = close < dailySMA
+plot(dailySMA, "Daily 50 SMA", color=color.orange, linewidth=2)
+bgcolor(bullRegime ? color.new(color.green, 95) : color.new(color.red, 95))
+
+// ──────────────────────────────────────────────
+// ── 2. 60-min SuperTrend & 34/55 EMA
+// ──────────────────────────────────────────────
+[supertrend, direction] = ta.supertrend(superMult, superPeriod)
+superUp   = direction < 0          // green
+superDown = direction > 0          // red
+plot(supertrend, "60min SuperTrend", color=superUp ? color.green : color.red, linewidth=2)
+
+ema34 = ta.ema(close, 34)
+ema55 = ta.ema(close, 55)
+emaBull = ema34 > ema55
+plot(ema34, "34 EMA", color=color.blue, linewidth=1)
+plot(ema55, "55 EMA", color=color.purple, linewidth=1)
+
+// ──────────────────────────────────────────────
+// ── 3. FREE Developing Session POC (from 9:30 ET)
+// ──────────────────────────────────────────────
+var float devPOC     = na
+var float devMaxVol  = 0.0
+if ta.change(time("D"))
+    devPOC    := close
+    devMaxVol := volume
+
+float priceBin = syminfo.mintick * math.round(close / syminfo.mintick)
+float binVol   = volume
+if priceBin == priceBin[1]
+    binVol += binVol[1]
+
+if binVol > devMaxVol
+    devMaxVol := binVol
+    devPOC    := priceBin
+
+plot(devPOC, "Developing Session POC", color=color.fuchsia, linewidth=3, style=plot.style_linebr)
+
+// ── Prior Day POC
+priorDayPOC = request.security(syminfo.tickerid, "D", devPOC[1])
+plot(priorDayPOC, "Prior Day POC", color=color.yellow, linewidth=2, style=plot.style_circles)
+
+// ── POC Filter (only trade toward the strongest node)
+float targetPOC = math.max(devPOC, priorDayPOC)
+longTowardPOC  = usePOCfilter ? close <= targetPOC : true
+shortTowardPOC = usePOCfilter ? close >= targetPOC : true
+
+// ──────────────────────────────────────────────
+// ── 4. 5-min Pullback Entry Trigger (34 EMA touch & bounce)
+// ──────────────────────────────────────────────
+ema34_5min = request.security(syminfo.tickerid, "5", ta.ema(close, 34))
+pullbackLong = close > ema34_5min and close[1] <= ema34_5min
+
+// ──────────────────────────────────────────────
+// ── 5. Final Entry Conditions
+// ──────────────────────────────────────────────
+longCondition  = bullRegime and superUp and emaBull and pullbackLong and longTowardPOC and strategy.position_size == 0
+shortCondition = bearRegime and superDown and not emaBull and shortTowardPOC and strategy.position_size == 0  // optional
+
+if (longCondition)
+    strategy.entry("Long", strategy.long)
+
+if (shortCondition)
+    strategy.entry("Short", strategy.short)
+
+// ──────────────────────────────────────────────
+// ── 6. Exits – 1.5×ATR stop, 3R target (or trail with SuperTrend)
+// ──────────────────────────────────────────────
+atrVal    = ta.atr(atrLen)
+stopDist  = stopMult * atrVal
+
+strategy.exit("Take Profit / Stop", from_entry="Long", 
+              stop = strategy.position_avg_price - stopDist,
+              limit = strategy.position_avg_price + 3 * stopDist,
+              comment = "3R Fixed")
+
+strategy.exit("Take Profit / Stop", from_entry="Short", 
+              stop = strategy.position_avg_price + stopDist,
+              limit = strategy.position_avg_price - 3 * stopDist)
+
+// Optional pure SuperTrend trailing stop (uncomment if you prefer trailing over fixed 3R)
+// strategy.exit("Trail", from_entry="Long",  trail_points = (supertrend - syminfo.mintick*10)/syminfo.pointvalue, trail_offset = atrVal*2)
+
+// ──────────────────────────────────────────────
+// ── Visuals
+// ──────────────────────────────────────────────
+plotshape(longCondition,  title="LONG ENTRY",  location=location.belowbar, color=color.lime, style=shape.triangleup,   size=size.large)
+plotshape(shortCondition, title="SHORT ENTRY", location=location.abovebar, color=color.red,  style=shape.triangledown, size=size.large)
