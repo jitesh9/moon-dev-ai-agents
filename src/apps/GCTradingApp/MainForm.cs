@@ -103,6 +103,11 @@ public partial class MainForm : Form
     private SimulationEngine? _simulationEngine;
     private SimulationForm? _simulationForm;
 
+    // Circuit breakers for each strategy
+    private CircuitBreaker? _aggressiveCircuitBreaker;
+    private CircuitBreaker? _conservativeCircuitBreaker;
+    private CircuitBreaker? _mtfCircuitBreaker;
+
     // MTF UI Controls
     private CheckBox chkMTF_5m15m1H = null!;
     private CheckBox chkMTF_1m5m15m = null!;
