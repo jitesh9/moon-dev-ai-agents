@@ -1282,6 +1282,25 @@ public partial class MainForm : Form
         }
     }
 
+    /// <summary>
+    /// Feed historical bars to strategies (called when strategies start or when historical data loads)
+    /// </summary>
+    private void FeedHistoricalBarsToStrategies(List<BarData> bars)
+    {
+        if (bars == null || bars.Count == 0) return;
+
+        Logger.Info($"Feeding {bars.Count} historical bars to strategies");
+
+        foreach (var bar in bars)
+        {
+            _aggressiveEngine?.ProcessBar(bar);
+            _conservativeEngine?.ProcessBar(bar);
+            _mtfEngine?.ProcessBar(bar);
+        }
+
+        Logger.Info($"Fed {bars.Count} historical bars to strategies");
+    }
+
     private async Task PerformPositionReconciliationAsync()
     {
         if (_ibClient == null) return;
