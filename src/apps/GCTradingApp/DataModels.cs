@@ -22,6 +22,10 @@ public class AppState
     public double AggressiveSize { get; set; } = 1;
     public double ConservativeSize { get; set; } = 1;
     public bool StrategyRunning { get; set; } = false;
+    
+    // Trading hours (for Aggressive and Conservative strategies)
+    public int TradingHoursStart { get; set; } = 8;  // 8 AM
+    public int TradingHoursEnd { get; set; } = 17;   // 5 PM
 
     // Account tracking
     public double CurrentEquity { get; set; } = 0;
@@ -123,7 +127,8 @@ public class StrategyState
     public bool InPosition { get; set; } = false;
     public double EntryPrice { get; set; } = 0;
     public DateTime EntryTime { get; set; }
-    public int EntryBarCount { get; set; } = 0;
+    public long EntryBarIndex { get; set; } = 0;  // Absolute bar index (not list count)
+    public long TotalBarsProcessed { get; set; } = 0;  // For restoring absolute counter
     public double StopPrice { get; set; } = 0;
     public double TargetPrice { get; set; } = 0;
     public int CurrentOrderId { get; set; } = 0;
@@ -247,4 +252,98 @@ public class ExitConditionsResult
     public double UnrealizedPnL { get; set; }
     public double UnrealizedPnLPct { get; set; }
     public int BarsHeld { get; set; }
+}
+
+/// <summary>
+/// Settings for backtest simulation with realistic costs
+/// </summary>
+public class SimulationSettings
+{
+    /// <summary>
+    /// Commission per contract per side (e.g., $2.25 for GC futures)
+    /// </summary>
+    public double CommissionPerContract { get; set; } = 2.25;
+
+    /// <summary>
+    /// Slippage in ticks per side (GC tick = $0.10 = $10 per contract)
+    /// </summary>
+    public double SlippageTicks { get; set; } = 1.0;
+
+    /// <summary>
+    /// Tick value in dollars (GC = $10 per tick, 100 oz * $0.10)
+    /// </summary>
+    public double TickValue { get; set; } = 10.0;
+
+    /// <summary>
+    /// Contract multiplier (GC = 100 oz)
+    /// </summary>
+    public double ContractMultiplier { get; set; } = 100.0;
+
+    /// <summary>
+    /// Starting equity for simulation
+    /// </summary>
+    public double StartingEquity { get; set; } = 100000.0;
+}
+
+/// <summary>
+/// Represents a single simulated trade with all costs
+/// </summary>
+public class SimulatedTrade
+{
+    public string Strategy { get; set; } = "";
+    public DateTime EntryTime { get; set; }
+    public DateTime ExitTime { get; set; }
+    public double EntryPrice { get; set; }
+    public double ExitPrice { get; set; }
+    public int Contracts { get; set; }
+    public string ExitReason { get; set; } = "";
+
+    // Gross P&L (before costs)
+    public double GrossPnL { get; set; }
+
+    // Costs
+    public double Commission { get; set; }  // Total commission (entry + exit)
+    public double Slippage { get; set; }    // Total slippage cost (entry + exit)
+
+    // Net P&L (after costs)
+    public double NetPnL => GrossPnL - Commission - Slippage;
+
+    // Trade metrics
+    public int BarsHeld { get; set; }
+    public bool IsWinner => NetPnL > 0;
+}
+
+/// <summary>
+/// Aggregate metrics for simulation performance
+/// </summary>
+public class SimulationMetrics
+{
+    public int TotalTrades { get; set; }
+    public int WinningTrades { get; set; }
+    public int LosingTrades { get; set; }
+
+    public double GrossPnL { get; set; }
+    public double TotalCommission { get; set; }
+    public double TotalSlippage { get; set; }
+    public double NetPnL => GrossPnL - TotalCommission - TotalSlippage;
+
+    public double WinRate => TotalTrades > 0 ? (double)WinningTrades / TotalTrades * 100 : 0;
+
+    public double LargestWin { get; set; }
+    public double LargestLoss { get; set; }
+    public double AverageWin { get; set; }
+    public double AverageLoss { get; set; }
+
+    public double ProfitFactor => AverageLoss != 0 ? (AverageWin * WinningTrades) / (Math.Abs(AverageLoss) * LosingTrades) : 0;
+
+    public double MaxDrawdown { get; set; }
+    public double MaxDrawdownPct { get; set; }
+
+    public double StartingEquity { get; set; }
+    public double EndingEquity => StartingEquity + NetPnL;
+    public double ReturnPct => StartingEquity > 0 ? (NetPnL / StartingEquity) * 100 : 0;
+
+    // Cost analysis
+    public double CostPerTrade => TotalTrades > 0 ? (TotalCommission + TotalSlippage) / TotalTrades : 0;
+    public double CostAsPctOfGross => GrossPnL != 0 ? ((TotalCommission + TotalSlippage) / Math.Abs(GrossPnL)) * 100 : 0;
 }

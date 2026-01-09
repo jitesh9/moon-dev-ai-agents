@@ -19,6 +19,8 @@ public class GCStrategyEngine : IStrategyEngine
     private readonly int _fixedContracts;
     private readonly double _capitalAllocation;
     private readonly double _maxDrawdown;
+    private readonly int _tradingHoursStart;  // Start hour (0-23)
+    private readonly int _tradingHoursEnd;    // End hour (0-23)
 
     // Strategy parameters (from Python implementation)
     private readonly double _stopMult = 1.5;
@@ -40,7 +42,8 @@ public class GCStrategyEngine : IStrategyEngine
     private double _entryPrice;
     private double _pendingEntryPrice;  // Expected entry price (for logging)
     private DateTime _entryTime;
-    private int _entryBarCount;
+    private long _entryBarIndex;        // Absolute bar index at entry (not list count)
+    private long _totalBarsProcessed;   // Absolute counter, never decreases
     private double _stopPrice;
     private double _targetPrice;
     private int _currentOrderId;
@@ -62,8 +65,13 @@ public class GCStrategyEngine : IStrategyEngine
     private double _superTrend;
     private bool _bullRegime;
 
-    // MACD history for proper signal line calculation
-    private readonly List<double> _macdHistory = new();
+    // SuperTrend state tracking (persists across bars)
+    private double _stUpperBand;
+    private double _stLowerBand;
+    private int _stDirection = 1;  // 1 = bullish (use lower band), -1 = bearish (use upper band)
+    private bool _stInitialized = false;
+
+    // MACD signal line period
     private const int MacdSignalPeriod = 9;
 
     // Drawdown tracking
@@ -91,6 +99,8 @@ public class GCStrategyEngine : IStrategyEngine
         int fixedContracts = 0,
         double capitalAllocation = 0,
         double maxDrawdown = 0.11,
+        int tradingHoursStart = 8,
+        int tradingHoursEnd = 17,
         StrategyState? savedState = null)
     {
         _dataClient = dataClient;
@@ -101,6 +111,8 @@ public class GCStrategyEngine : IStrategyEngine
         _fixedContracts = fixedContracts;
         _capitalAllocation = capitalAllocation;
         _maxDrawdown = maxDrawdown;
+        _tradingHoursStart = tradingHoursStart;
+        _tradingHoursEnd = tradingHoursEnd;
 
         // Restore saved state if available
         if (savedState != null && savedState.InPosition)
@@ -108,7 +120,8 @@ public class GCStrategyEngine : IStrategyEngine
             _inPosition = savedState.InPosition;
             _entryPrice = savedState.EntryPrice;
             _entryTime = savedState.EntryTime;
-            _entryBarCount = savedState.EntryBarCount;
+            _entryBarIndex = savedState.EntryBarIndex;
+            _totalBarsProcessed = savedState.TotalBarsProcessed;
             _stopPrice = savedState.StopPrice;
             _targetPrice = savedState.TargetPrice;
             _currentOrderId = savedState.CurrentOrderId;
@@ -131,7 +144,8 @@ public class GCStrategyEngine : IStrategyEngine
             InPosition = _inPosition,
             EntryPrice = _entryPrice,
             EntryTime = _entryTime,
-            EntryBarCount = _entryBarCount,
+            EntryBarIndex = _entryBarIndex,
+            TotalBarsProcessed = _totalBarsProcessed,
             StopPrice = _stopPrice,
             TargetPrice = _targetPrice,
             CurrentOrderId = _currentOrderId,
@@ -193,6 +207,7 @@ public class GCStrategyEngine : IStrategyEngine
                 _bars.Add(bar);
                 if (_bars.Count > _lookback) _bars.RemoveAt(0);
                 barCount = _bars.Count;
+                _totalBarsProcessed++;  // Absolute counter for accurate bars held calculation
             }
 
             // Need enough bars for indicators
@@ -201,14 +216,16 @@ public class GCStrategyEngine : IStrategyEngine
             // Calculate indicators (takes snapshot inside lock)
             CalculateIndicators();
 
-            // Check if it's regular trading hours (8 AM - 5 PM)
+            // Check if it's regular trading hours (only for entry, not position management)
             var hour = bar.Time.Hour;
-            bool inTradingHours = hour >= 8 && hour < 17;
+            bool inTradingHours = IsWithinTradingHours(hour);
 
+            // Position management always runs (allows positions to stay open overnight)
             if (_inPosition && !_pendingExit)
             {
                 ManagePosition(bar);
             }
+            // Entry only allowed during trading hours
             else if (!_inPosition && !_pendingEntry && inTradingHours)
             {
                 CheckEntry(bar);
@@ -311,6 +328,9 @@ public class GCStrategyEngine : IStrategyEngine
         _orderClient.PlaceMarketOrder("BUY", _positionQuantity, _strategyName);
     }
 
+    // Minimum bars between divergence lows for meaningful price structure
+    private const int MinDivergenceSeparation = 5;
+
     private bool DetectBullishDivergence()
     {
         List<BarData> barsSnapshot;
@@ -332,15 +352,24 @@ public class GCStrategyEngine : IStrategyEngine
             rsiValues[i] = CalculateRSI(subset, 14);
         }
 
-        // Find local lows
+        // Find local lows with minimum separation
+        // A local low requires price to be lower than 2 bars on each side
         int priceLow1 = -1, priceLow2 = -1;
-        for (int i = 5; i < 15; i++)
+        for (int i = 2; i < 18; i++)  // Expanded search range (need 2 bars on each side)
         {
             if (closes[i] < closes[i - 1] && closes[i] < closes[i + 1] &&
                 closes[i] < closes[i - 2] && closes[i] < closes[i + 2])
             {
-                if (priceLow1 < 0) priceLow1 = i;
-                else priceLow2 = i;
+                if (priceLow1 < 0)
+                {
+                    priceLow1 = i;
+                }
+                else if (i >= priceLow1 + MinDivergenceSeparation)
+                {
+                    // Only accept second low if it's at least MinDivergenceSeparation bars after first
+                    priceLow2 = i;
+                    break;  // Found valid pair, stop searching
+                }
             }
         }
 
@@ -366,8 +395,8 @@ public class GCStrategyEngine : IStrategyEngine
         // 2. EMA bullish (13 > 34)
         if (_ema13 > _ema34) count++;
 
-        // 3. SuperTrend bullish
-        if (bar.Close > _superTrend) count++;
+        // 3. SuperTrend bullish (use tracked direction, not just price comparison)
+        if (_stDirection == 1) count++;
 
         // 4. RSI in valid range (30-70)
         if (_rsi >= 30 && _rsi <= 70) count++;
@@ -379,7 +408,7 @@ public class GCStrategyEngine : IStrategyEngine
         double avgAtr;
         lock (_barsLock)
         {
-            avgAtr = _bars.TakeLast(20).Average(b => CalculateBarATR(b));
+            avgAtr = _bars.TakeLast(20).Average(b => CalculateBarRange(b));
         }
         if (_atr > avgAtr * 0.8) count++;
 
@@ -427,11 +456,10 @@ public class GCStrategyEngine : IStrategyEngine
     {
         var price = bar.Close;
         var pnlPct = ((price / _entryPrice) - 1) * 100;
-        int barsHeld;
-        lock (_barsLock)
-        {
-            barsHeld = _bars.Count - _entryBarCount;
-        }
+
+        // Use absolute bar index for accurate bars held calculation
+        // This works correctly even when _bars list is trimmed at _lookback
+        var barsHeld = (int)(_totalBarsProcessed - _entryBarIndex);
 
         // Trailing stop
         if (pnlPct >= _trailStartPct)
@@ -522,10 +550,7 @@ public class GCStrategyEngine : IStrategyEngine
                 _inPosition = true;
                 _entryPrice = status.AvgFillPrice;
                 _entryTime = DateTime.Now;
-                lock (_barsLock)
-                {
-                    _entryBarCount = _bars.Count;
-                }
+                _entryBarIndex = _totalBarsProcessed;  // Use absolute index
                 Log($"ENTRY CONFIRMED at {_entryPrice:F2}");
                 NotifyStateChanged();  // Persist position state
             }
@@ -584,7 +609,12 @@ public class GCStrategyEngine : IStrategyEngine
         return trValues.TakeLast(period).Average();
     }
 
-    private double CalculateBarATR(BarData bar)
+    /// <summary>
+    /// Calculates the bar's range (High - Low).
+    /// Note: This is NOT True Range (which requires previous close).
+    /// Used for volatility comparison between bars.
+    /// </summary>
+    private double CalculateBarRange(BarData bar)
     {
         return bar.High - bar.Low;
     }
@@ -611,26 +641,50 @@ public class GCStrategyEngine : IStrategyEngine
         return 100 - (100 / (1 + rs));
     }
 
+    /// <summary>
+    /// Calculates MACD indicator (12/26 EMA with 9-period signal line).
+    /// This implementation is stateless - it calculates MACD values for recent bars
+    /// and derives the signal line from those values, avoiding state corruption
+    /// during simulation backward navigation.
+    /// </summary>
     private (double macd, double signal, double hist) CalculateMACD(double[] closes)
     {
+        if (closes.Length < 26) return (0, 0, 0);
+
+        // Calculate current MACD (EMA12 - EMA26)
         var ema12 = CalculateEMA(closes, 12);
         var ema26 = CalculateEMA(closes, 26);
         var macd = ema12 - ema26;
 
-        // Store MACD value for signal line calculation
-        _macdHistory.Add(macd);
-        if (_macdHistory.Count > _lookback)
-            _macdHistory.RemoveAt(0);
+        // Calculate MACD values for recent bars to derive signal line
+        // We need at least MacdSignalPeriod MACD values for the signal EMA
+        int macdHistoryLength = Math.Min(MacdSignalPeriod + 10, closes.Length - 26);
+        if (macdHistoryLength <= 0)
+        {
+            // Not enough data for signal line, return MACD with itself as signal
+            return (macd, macd, 0);
+        }
+        var macdValues = new double[macdHistoryLength];
+
+        for (int i = 0; i < macdHistoryLength; i++)
+        {
+            // Calculate MACD at (closes.Length - macdHistoryLength + i + 1) position
+            int endIdx = closes.Length - macdHistoryLength + i + 1;
+            var subset = closes.Take(endIdx).ToArray();
+            var subEma12 = CalculateEMA(subset, 12);
+            var subEma26 = CalculateEMA(subset, 26);
+            macdValues[i] = subEma12 - subEma26;
+        }
 
         // Signal line is 9-period EMA of MACD values
         double signal;
-        if (_macdHistory.Count >= MacdSignalPeriod)
+        if (macdValues.Length >= MacdSignalPeriod)
         {
-            signal = CalculateEMA(_macdHistory.ToArray(), MacdSignalPeriod);
+            signal = CalculateEMA(macdValues, MacdSignalPeriod);
         }
         else
         {
-            signal = _macdHistory.Average();
+            signal = macdValues.Average();
         }
 
         var hist = macd - signal;
@@ -653,19 +707,90 @@ public class GCStrategyEngine : IStrategyEngine
         return ema;
     }
 
+    /// <summary>
+    /// Calculates SuperTrend indicator with proper state tracking across bars.
+    /// SuperTrend is a trend-following indicator that uses ATR to create dynamic support/resistance.
+    /// The indicator flips direction only when price closes beyond the opposite band.
+    /// </summary>
     private double CalculateSuperTrend(double[] highs, double[] lows, double[] closes, int period, double multiplier)
     {
         if (closes.Length < period) return closes.Last();
 
         var atr = CalculateATR(highs, lows, closes, period);
-        var hl2 = (highs.Last() + lows.Last()) / 2;
+        var currentClose = closes[^1];  // Latest close
+        var prevClose = closes.Length > 1 ? closes[^2] : currentClose;
+        var hl2 = (highs[^1] + lows[^1]) / 2;
 
-        var upperBand = hl2 + (multiplier * atr);
-        var lowerBand = hl2 - (multiplier * atr);
+        // Calculate basic bands
+        var basicUpperBand = hl2 + (multiplier * atr);
+        var basicLowerBand = hl2 - (multiplier * atr);
 
-        // Simplified: return lower band for bullish
-        return closes.Last() > hl2 ? lowerBand : upperBand;
+        // Initialize on first call
+        if (!_stInitialized)
+        {
+            _stUpperBand = basicUpperBand;
+            _stLowerBand = basicLowerBand;
+            _stDirection = currentClose > hl2 ? 1 : -1;
+            _stInitialized = true;
+            _superTrend = _stDirection == 1 ? _stLowerBand : _stUpperBand;
+            return _superTrend;
+        }
+
+        // Final Upper Band: can only go DOWN (or stay same) when in uptrend
+        // If previous close was above previous upper band, use min of basic and previous
+        // Otherwise reset to basic upper band
+        double finalUpperBand;
+        if (prevClose > _stUpperBand)
+        {
+            finalUpperBand = Math.Min(basicUpperBand, _stUpperBand);
+        }
+        else
+        {
+            finalUpperBand = basicUpperBand;
+        }
+
+        // Final Lower Band: can only go UP (or stay same) when in downtrend
+        // If previous close was below previous lower band, use max of basic and previous
+        // Otherwise reset to basic lower band
+        double finalLowerBand;
+        if (prevClose < _stLowerBand)
+        {
+            finalLowerBand = Math.Max(basicLowerBand, _stLowerBand);
+        }
+        else
+        {
+            finalLowerBand = basicLowerBand;
+        }
+
+        // Determine trend direction
+        // If previously bullish (direction = 1), stay bullish unless close breaks below lower band
+        // If previously bearish (direction = -1), stay bearish unless close breaks above upper band
+        int newDirection;
+        if (_stDirection == 1)
+        {
+            // Was bullish - check if we break below support
+            newDirection = currentClose < finalLowerBand ? -1 : 1;
+        }
+        else
+        {
+            // Was bearish - check if we break above resistance
+            newDirection = currentClose > finalUpperBand ? 1 : -1;
+        }
+
+        // Update state for next bar
+        _stUpperBand = finalUpperBand;
+        _stLowerBand = finalLowerBand;
+        _stDirection = newDirection;
+
+        // SuperTrend value: lower band when bullish, upper band when bearish
+        _superTrend = _stDirection == 1 ? _stLowerBand : _stUpperBand;
+        return _superTrend;
     }
+
+    /// <summary>
+    /// Gets the current SuperTrend direction (1 = bullish, -1 = bearish)
+    /// </summary>
+    public int SuperTrendDirection => _stDirection;
 
     /// <summary>
     /// Evaluates all entry conditions and returns their status
@@ -761,12 +886,17 @@ public class GCStrategyEngine : IStrategyEngine
 
         // Check trading hours
         var hour = bar.Time.Hour;
-        bool inTradingHours = hour >= 8 && hour < 17;
+        bool inTradingHours = IsWithinTradingHours(hour);
+        string tradingHoursDesc = $"Within trading hours ({_tradingHoursStart:00}:00 - {_tradingHoursEnd:00}:00)";
+        if (!inTradingHours)
+        {
+            tradingHoursDesc = $"Outside trading hours ({_tradingHoursStart:00}:00 - {_tradingHoursEnd:00}:00)";
+        }
         result.Conditions.Add(new EntryConditionStatus
         {
             ConditionName = "Trading Hours",
             IsTrue = inTradingHours,
-            Description = inTradingHours ? "Within trading hours (8 AM - 5 PM)" : "Outside trading hours",
+            Description = tradingHoursDesc,
             Value = $"{hour:00}:00"
         });
 
@@ -869,14 +999,14 @@ public class GCStrategyEngine : IStrategyEngine
             Value = $"EMA13: {_ema13:F2}, EMA34: {_ema34:F2}"
         });
 
-        // 3. SuperTrend bullish
-        bool superTrendBullish = bar.Close > _superTrend;
+        // 3. SuperTrend bullish (use tracked direction for proper state)
+        bool superTrendBullish = _stDirection == 1;
         conditions.Add(new EntryConditionStatus
         {
             ConditionName = "SuperTrend",
             IsTrue = superTrendBullish,
-            Description = superTrendBullish ? "Price > SuperTrend" : "Price < SuperTrend",
-            Value = $"ST: {_superTrend:F2}"
+            Description = superTrendBullish ? "SuperTrend Bullish (uptrend)" : "SuperTrend Bearish (downtrend)",
+            Value = $"ST: {_superTrend:F2}, Dir: {(_stDirection == 1 ? "▲" : "▼")}"
         });
 
         // 4. RSI in valid range (30-70)
@@ -900,12 +1030,12 @@ public class GCStrategyEngine : IStrategyEngine
         });
 
         // 6. Volatility OK (ATR > threshold)
-        double avgAtr;
+        double avgRange;
         lock (_barsLock)
         {
-            avgAtr = _bars.TakeLast(20).Average(b => CalculateBarATR(b));
+            avgRange = _bars.TakeLast(20).Average(b => CalculateBarRange(b));
         }
-        bool volatilityOk = _atr > avgAtr * 0.8;
+        bool volatilityOk = _atr > avgRange * 0.8;
         conditions.Add(new EntryConditionStatus
         {
             ConditionName = "Volatility",
@@ -969,11 +1099,8 @@ public class GCStrategyEngine : IStrategyEngine
         var pnlPct = ((price / _entryPrice) - 1) * 100;
         var pnl = (price - _entryPrice) * (double)_positionQuantity * 100; // 100 oz multiplier
 
-        int barsHeld;
-        lock (_barsLock)
-        {
-            barsHeld = _bars.Count - _entryBarCount;
-        }
+        // Use absolute bar index for accurate bars held calculation
+        var barsHeld = (int)(_totalBarsProcessed - _entryBarIndex);
 
         result.CurrentPrice = price;
         result.UnrealizedPnL = pnl;
@@ -1107,6 +1234,23 @@ public class GCStrategyEngine : IStrategyEngine
         });
 
         return result;
+    }
+
+    /// <summary>
+    /// Checks if the given hour is within trading hours
+    /// </summary>
+    private bool IsWithinTradingHours(int hour)
+    {
+        if (_tradingHoursStart <= _tradingHoursEnd)
+        {
+            // Normal case: start < end (e.g., 8-17)
+            return hour >= _tradingHoursStart && hour < _tradingHoursEnd;
+        }
+        else
+        {
+            // Wraps around midnight (e.g., 22-6)
+            return hour >= _tradingHoursStart || hour < _tradingHoursEnd;
+        }
     }
 
     private void Log(string message)
