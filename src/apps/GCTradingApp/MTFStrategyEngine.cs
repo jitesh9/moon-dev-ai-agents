@@ -123,7 +123,7 @@ public class MTFStrategyEngine : IStrategyEngine
             _inPosition = savedState.InPosition;
             _entryPrice = savedState.EntryPrice;
             _entryTime = savedState.EntryTime;
-            _entryBarCount = savedState.EntryBarCount;
+            _entryBarCount = (int)savedState.EntryBarIndex;
             _stopPrice = savedState.StopPrice;
             _targetPrice = savedState.TargetPrice;
             _currentOrderId = savedState.CurrentOrderId;
@@ -155,7 +155,7 @@ public class MTFStrategyEngine : IStrategyEngine
             InPosition = _inPosition,
             EntryPrice = _entryPrice,
             EntryTime = _entryTime,
-            EntryBarCount = _entryBarCount,
+            EntryBarIndex = _entryBarCount,
             StopPrice = _stopPrice,
             TargetPrice = _targetPrice,
             CurrentOrderId = _currentOrderId,
